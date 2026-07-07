@@ -8,11 +8,17 @@ tailscale-install::check() {
 }
 tailscale-install::apply() {
   if ! command -v tailscale >/dev/null; then
-    local codename
+    local codename distro
     codename="$(lsb_release -cs)"
-    curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${codename}.noarmor.gpg" \
+    # tailscale serves separate apt repos per distro: /stable/ubuntu/<codename>
+    # and /stable/debian/<codename>. Using the wrong one 404s (e.g. Debian
+    # bookworm under the ubuntu path), so derive the distro from os-release.
+    # This makes node-setup work on Ubuntu workers AND Debian (Hetzner debian-12).
+    distro="$(. /etc/os-release 2>/dev/null && echo "${ID:-}")"
+    case "$distro" in ubuntu|debian) ;; *) distro="ubuntu" ;; esac
+    curl -fsSL "https://pkgs.tailscale.com/stable/${distro}/${codename}.noarmor.gpg" \
       -o /usr/share/keyrings/tailscale-archive-keyring.gpg
-    echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu ${codename} main" \
+    echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/${distro} ${codename} main" \
       > /etc/apt/sources.list.d/tailscale.list
     apt-get update
     if [[ -n "${TAILSCALE_VERSION:-}" ]]; then
