@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+#
+# node-setup - one-command, resumable provisioning for browser.lol / guard.ch nodes.
+#
+#   node-setup                                  # guided (asks role, modules, server IP)
+#   node-setup --role worker --yes
+#   node-setup --role worker --modules gpu-intel,deadssd
+#   node-setup --role worker --server 100.x.y.z # join a specific control plane
+#   node-setup doctor                           # read-only drift report for this node
+#   node-setup status                           # journal + node identity
+#   node-setup steps [--role X]                 # list the step plan
+#
+# Flags: --yes  --dry-run  --server ip  --only step[,step]  --skip step[,step]  --resume
+#
+# Roles: worker | gateway | control-plane | db
+# (the registry host and the dev server are NOT managed here; the dev server
+# is hand-configured per wiki/DEV.md)
+#
+# --server sets the control-plane Tailscale IP that workers/gateways join
+# (default: K3S_SERVER_IP in setup/cluster.env). When bootstrapping a brand-new
+# cluster: provision the control-plane first (it prints its IP), then the
+# workers with --server <that ip>.
+#
+# Secrets are read from /etc/node-setup/secrets.env (pushed by infra/provision.sh,
+# deleted when the run completes). Missing secrets are prompted for interactively.
+# Re-running is always safe: completed steps are journaled and skipped; a changed
+# step definition or a bumped versions.env re-applies exactly what changed.
+set -euo pipefail
+
+NODE_SETUP_BIN="$(readlink -f "$0")"
+export NODE_SETUP_BIN
+SETUP_DIR="$(cd "$(dirname "$NODE_SETUP_BIN")" && pwd)"
+BUNDLE_DIR="$(dirname "$SETUP_DIR")"
+PAYLOAD_DIR="$SETUP_DIR/payloads"
+# manifests: provision.sh ships them to <bundle>/manifests; when running from
+# a repo checkout they live in wiki/k8s-manifests instead
+MANIFEST_DIR="$BUNDLE_DIR/manifests"
+[[ -d "$MANIFEST_DIR" ]] || MANIFEST_DIR="$(dirname "$BUNDLE_DIR")/wiki/k8s-manifests"
+VERSIONS_FILE="$SETUP_DIR/versions.env"
+# Real per-cluster config is provided at provision time (provision.sh --cluster-env,
+# or copy the file in). A bare checkout falls back to the committed template so the
+# framework still runs; placeholder values only bite a step that actually uses them.
+CLUSTER_ENV_FILE="$SETUP_DIR/cluster.env"
+[[ -f "$CLUSTER_ENV_FILE" ]] || CLUSTER_ENV_FILE="$SETUP_DIR/cluster.env.example"
+export PAYLOAD_DIR MANIFEST_DIR VERSIONS_FILE CLUSTER_ENV_FILE
+
+# shellcheck source=lib/framework.sh
+source "$SETUP_DIR/lib/framework.sh"
+
+ROLES=(worker gateway control-plane db)
+OPTIONAL_MODULES=(gpu-intel deadssd)
+
+usage() { sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# --- argument parsing ---------------------------------------------------------
+CMD="apply"
+ROLE=""
+EXTRA_MODULES=""
+SERVER_IP=""
+RESUME=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    doctor|status|steps) CMD="$1" ;;
+    --role)     ROLE="${2:?--role needs a value}"; shift ;;
+    --modules)  EXTRA_MODULES="${2:?--modules needs a value}"; shift ;;
+    --server)   SERVER_IP="${2:?--server needs a value}"; shift ;;
+    --only)     ONLY_STEPS="${2:?--only needs a value}"; shift ;;
+    --skip)     SKIP_STEPS="${2:?--skip needs a value}"; shift ;;
+    --yes|-y)   ASSUME_YES=1 ;;
+    --dry-run)  DRY_RUN=1 ;;
+    --resume)   RESUME=1; ASSUME_YES=1 ;;
+    -h|--help)  usage; exit 0 ;;
+    *) die "unknown argument: $1 (see --help)" ;;
+  esac
+  shift
+done
+
+[[ -t 0 && "$ASSUME_YES" != "1" ]] && INTERACTIVE=1
+
+in_list() { local x="$1"; shift; local i; for i in "$@"; do [[ "$i" == "$x" ]] && return 0; done; return 1; }
+
+# --- node identity (persisted so doctor/status/resume know who this node is) ---
+load_node_conf() {
+  if [[ -f "$CONF_DIR/node.conf" ]]; then
+    # shellcheck disable=SC1091
+    source "$CONF_DIR/node.conf"
+    ROLE="${ROLE:-${NODE_ROLE:-}}"
+    EXTRA_MODULES="${EXTRA_MODULES:-${NODE_EXTRA_MODULES:-}}"
+    SERVER_IP="${SERVER_IP:-${NODE_K3S_SERVER:-}}"
+  fi
+}
+
+save_node_conf() {
+  mkdir -p "$CONF_DIR"
+  write_if_changed "$CONF_DIR/node.conf" 0644 <<EOF || true
+# Written by node-setup; identifies this node for doctor/status/resume.
+NODE_ROLE="$ROLE"
+NODE_EXTRA_MODULES="$EXTRA_MODULES"
+NODE_K3S_SERVER="$SERVER_IP"
+EOF
+}
+
+# --- guided prompts -------------------------------------------------------------
+prompt_choice() { # prompt_choice VAR "question" options...
+  local __var="$1" q="$2" ans
+  shift 2
+  echo "$q"
+  select ans in "$@"; do
+    [[ -n "${ans:-}" ]] && { printf -v "$__var" '%s' "$ans"; break; }
+    echo "invalid choice"
+  done
+}
+
+guided_setup() {
+  echo
+  echo "=== node-setup: guided provisioning ==="
+  echo "This provisions the current host as a browser.lol / guard.ch node."
+  echo
+  [[ -n "$ROLE" ]] || prompt_choice ROLE "Which role should this node have?" "${ROLES[@]}"
+
+  if [[ -z "$SERVER_IP" && ( "$ROLE" == "worker" || "$ROLE" == "gateway" ) ]]; then
+    local reply
+    read -r -p "Control plane Tailscale IP [${K3S_SERVER_IP_DEFAULT}]: " reply
+    SERVER_IP="${reply:-}"
+  fi
+
+  if [[ -z "$EXTRA_MODULES" && ( "$ROLE" == "worker" || "$ROLE" == "gateway" ) ]]; then
+    local m mods=()
+    for m in "${OPTIONAL_MODULES[@]}"; do
+      local hint=""
+      [[ "$m" == "gpu-intel"  ]] && hint="(Hetzner iGPU nodes: unblacklist i915, needs a reboot)"
+      [[ "$m" == "deadssd"    ]] && hint="(dying-disk nodes only: containerd on tmpfs)"
+      local reply
+      read -r -p "Enable optional module '$m' $hint? [y/N] " reply
+      [[ "$reply" =~ ^[Yy] ]] && mods+=("$m")
+    done
+    EXTRA_MODULES="$(IFS=,; echo "${mods[*]-}")"
+  fi
+  echo
+  echo "  role:          $ROLE"
+  echo "  modules:       ${EXTRA_MODULES:-none}"
+  if [[ "$ROLE" == "worker" || "$ROLE" == "gateway" ]]; then
+    echo "  control plane: ${SERVER_IP:-$K3S_SERVER_IP_DEFAULT (default)}"
+  fi
+  echo
+  confirm "Proceed with this configuration?" || die "aborted"
+}
+
+# --- environment loading ----------------------------------------------------------
+# Loads cluster.env only (for the K3S_SERVER_IP default); needed before the
+# guided prompt can show the default.
+load_cluster_env() {
+  # shellcheck disable=SC1090
+  source "$VERSIONS_FILE"
+  # shellcheck disable=SC1091
+  source "$CLUSTER_ENV_FILE"
+  K3S_SERVER_IP_DEFAULT="$K3S_SERVER_IP"
+}
+
+load_environment() {
+  in_list "$ROLE" "${ROLES[@]}" || die "unknown role '$ROLE' (valid: ${ROLES[*]})"
+
+  # --server (or the persisted node.conf value) overrides the cluster default
+  if [[ -n "$SERVER_IP" ]]; then
+    [[ "$SERVER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+      || die "--server '$SERVER_IP' is not an IPv4 address (expected the control plane's Tailscale IP)"
+    K3S_SERVER_IP="$SERVER_IP"
+  fi
+  K3S_URL="https://${K3S_SERVER_IP}:6443"
+
+  local mod
+  for mod in "$SETUP_DIR"/modules/*.sh; do
+    # shellcheck disable=SC1090
+    source "$mod"
+  done
+  # shellcheck disable=SC1090
+  source "$SETUP_DIR/roles/$ROLE.sh"
+
+  # append opted-in extra modules to the role's step list
+  if [[ -n "$EXTRA_MODULES" ]]; then
+    local IFS=','
+    for mod in $EXTRA_MODULES; do
+      in_list "$mod" "${OPTIONAL_MODULES[@]}" || die "unknown optional module '$mod' (valid: ${OPTIONAL_MODULES[*]})"
+      case "$mod" in
+        gpu-intel) ROLE_STEPS+=(gpu-intel) ;;
+        deadssd)   ROLE_STEPS+=(deadssd-tmpfs) ;;
+      esac
+    done
+  fi
+}
+
+# --- completion --------------------------------------------------------------------
+finish_run() {
+  remove_resume_unit
+  if [[ -f "$CONF_DIR/secrets.env" ]]; then
+    shred -u "$CONF_DIR/secrets.env" 2>/dev/null || rm -f "$CONF_DIR/secrets.env"
+    log "removed transient secrets file $CONF_DIR/secrets.env"
+  fi
+  # convenience: make `node-setup` available on PATH for doctor/status later
+  ln -sf "$NODE_SETUP_BIN" /usr/local/bin/node-setup
+  echo
+  ok "provisioning complete: role=$ROLE"
+  if [[ "$ROLE" == "control-plane" ]]; then
+    ok "workers join this control plane with: node-setup --role worker --server $(ts_ip)"
+  fi
+  ok "re-check any time with: node-setup doctor"
+}
+
+# --- subcommands ----------------------------------------------------------------------
+cmd_apply() {
+  require_root
+  mkdir -p "$STATE_DIR" "$CONF_DIR"
+  load_node_conf
+  load_cluster_env
+  if [[ "$RESUME" == "1" ]]; then
+    [[ -n "$ROLE" ]] || die "--resume but no $CONF_DIR/node.conf; run node-setup with --role"
+    log "resuming provisioning after reboot: role=$ROLE"
+  elif [[ -z "$ROLE" ]]; then
+    [[ "$INTERACTIVE" == "1" ]] || die "need --role in non-interactive mode"
+    guided_setup
+  fi
+  save_node_conf
+  load_environment
+  load_secrets
+
+  log "plan: ${ROLE_STEPS[*]}"
+  if [[ "$ROLE" == "worker" || "$ROLE" == "gateway" ]]; then
+    log "control plane: $K3S_SERVER_IP"
+  fi
+  if [[ "$DRY_RUN" == "1" ]]; then
+    warn "dry-run: no changes will be made"
+  fi
+  run_steps "${ROLE_STEPS[@]}"
+  [[ "$DRY_RUN" == "1" ]] && { ok "dry-run complete"; return 0; }
+  finish_run
+}
+
+cmd_doctor() {
+  require_root
+  load_node_conf
+  [[ -n "$ROLE" ]] || die "node not provisioned by node-setup yet (no $CONF_DIR/node.conf)"
+  load_cluster_env
+  load_environment
+  load_secrets
+  log "doctor: role=$ROLE host=$(hostname)"
+  if doctor_steps "${ROLE_STEPS[@]}"; then
+    ok "all checks passed"
+  else
+    err "some checks FAILED; re-apply with: node-setup --role $ROLE"
+    return 1
+  fi
+}
+
+cmd_status() {
+  load_node_conf
+  echo "host:     $(hostname)"
+  echo "role:     ${ROLE:-<unprovisioned>}"
+  echo "modules:  ${EXTRA_MODULES:-none}"
+  [[ -n "$SERVER_IP" ]] && echo "server:   $SERVER_IP (override)"
+  if [[ -f /etc/systemd/system/node-setup-resume.service ]]; then
+    echo "resume:   PENDING (a reboot-interrupted run will continue on boot)"
+  fi
+  if [[ -d "$STATE_DIR/state" ]]; then
+    echo "journal:  $(find "$STATE_DIR/state" -name '*.hash' | wc -l) steps completed"
+    find "$STATE_DIR/state" -name '*.hash' -printf '  - %f\n' 2>/dev/null | sed 's/\.hash$//' | sort
+  else
+    echo "journal:  empty"
+  fi
+}
+
+cmd_steps() {
+  load_node_conf
+  [[ -n "$ROLE" ]] || die "pass --role (node has no node.conf yet)"
+  load_cluster_env
+  load_environment
+  local s
+  for s in "${ROLE_STEPS[@]}"; do
+    printf '%-28s %s\n' "$s" "${STEP_DESC[$s]:-}"
+  done
+}
+
+case "$CMD" in
+  apply)  cmd_apply ;;
+  doctor) cmd_doctor ;;
+  status) cmd_status ;;
+  steps)  cmd_steps ;;
+esac

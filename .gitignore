@@ -1,0 +1,6 @@
+# This repo is public and ships NO credentials. Never commit real secrets;
+# provide them at run time (see docs/SECRETS.md). Guard against a stray local
+# secrets file used while testing provision.sh.
+secrets.env
+*.secrets.env
+.DS_Store
