@@ -14,13 +14,18 @@ docker-install::apply() {
     die "docker is installed via snap on this host; remove it first (snap remove docker) - snap docker conflicts with k3s"
   fi
   if [[ ! -f /etc/apt/sources.list.d/docker.list ]]; then
-    local codename arch
+    local codename arch distro
     codename="$(lsb_release -cs)"
     arch="$(dpkg --print-architecture)"
+    # docker-ce has separate apt repos per distro (linux/ubuntu vs linux/debian);
+    # the ubuntu repo has no candidate for a Debian codename. Derive from
+    # os-release so this works on Ubuntu workers AND Debian.
+    distro="$(. /etc/os-release 2>/dev/null && echo "${ID:-}")"
+    case "$distro" in ubuntu|debian) ;; *) distro="ubuntu" ;; esac
     install -d -m 0755 /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    curl -fsSL "https://download.docker.com/linux/${distro}/gpg" -o /etc/apt/keyrings/docker.asc
     chmod a+r /etc/apt/keyrings/docker.asc
-    echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${codename} stable" \
+    echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${distro} ${codename} stable" \
       > /etc/apt/sources.list.d/docker.list
     apt-get update
   fi
