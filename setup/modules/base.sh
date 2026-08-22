@@ -120,6 +120,8 @@ EOF
   return 0
 }
 base-ssh-harden::verify() {
+  # /run/sshd is absent on a fresh image until sshd first starts; sshd -t needs it.
+  mkdir -p /run/sshd
   sshd -t 2>/dev/null
 }
 
