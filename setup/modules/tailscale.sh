@@ -48,7 +48,7 @@ tailscale-up::apply() {
   #   https://login.tailscale.com/admin/settings/keys
   require_secrets TS_AUTHKEY
   tailscale up --authkey "${TS_AUTHKEY}" --hostname "$(hostname)" \
-    --accept-dns=false --auto-update=false
+    --accept-dns=false
   tailscale set --auto-update=false || true
 }
 tailscale-up::verify() {
