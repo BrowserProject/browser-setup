@@ -14,7 +14,8 @@ _ufw_current_ssh_client() {
   if [[ -n "${SSH_CONNECTION:-}" ]]; then
     echo "${SSH_CONNECTION%% *}"
   else
-    who am i 2>/dev/null | grep -oE '\(([0-9a-fA-F:.]+)\)' | tr -d '()' | head -n1
+    # Unattended runs (cloud-init, no tty) match nothing: must not trip pipefail.
+    who am i 2>/dev/null | grep -oE '\(([0-9a-fA-F:.]+)\)' | tr -d '()' | head -n1 || true
   fi
 }
 
