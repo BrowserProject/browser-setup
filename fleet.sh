@@ -27,7 +27,7 @@ nodes() { # [label-selector] -> "name ip" lines
 }
 
 cmd_list() {
-  $KUBECTL get nodes -o wide -L type,gpu
+  $KUBECTL get nodes -o wide -L type
 }
 
 cmd_run() {

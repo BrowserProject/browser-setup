@@ -27,8 +27,7 @@ flannel-watchdog oom-guards net-limits hw-watchdog disk-guard
 [exitnode-routing]          # when EXITNODE_ROUTING=1 in cluster.env
 ```
 
-Optional modules: `gpu-intel` (Hetzner iGPU for hardware H.264 encode, needs a
-reboot), `deadssd` (tmpfs mitigation for a dying disk), `direct-egress` (worker
+Optional modules: `deadssd` (tmpfs mitigation for a dying disk), `direct-egress` (worker
 sessions leave through the node's own address: replaces `exitnode-routing`,
 keeps its sysctl tuning, clears any exit node).
 

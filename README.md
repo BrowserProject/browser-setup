@@ -16,8 +16,8 @@ provisioning and by the API's **automated burst-capacity** provisioner.
 ./provision.sh root@1.2.3.4 --role control-plane --tailscale-key tskey-auth-... --manifests /path/to/k8s-manifests
 ./provision.sh root@1.2.3.4 --role db            --secrets-file ./secrets.env
 
-# worker with optional modules (Hetzner iGPU, dying-disk tmpfs mitigation)
-./provision.sh root@1.2.3.4 --role worker --modules gpu-intel,deadssd --tailscale-key ...
+# worker with an optional module (dying-disk tmpfs mitigation)
+./provision.sh root@1.2.3.4 --role worker --modules deadssd --tailscale-key ...
 
 # fully guided (prompts for role/modules/secrets on the node)
 ./provision.sh root@1.2.3.4
@@ -62,7 +62,7 @@ passed to `/etc/node-setup/secrets.env` (0600), and runs `node-setup`.
   `setup/versions.env` re-applies exactly the affected steps. Existing manual
   state is *adopted* (check passes -> marked done, nothing re-applied), so you
   can point it at a hand-built node without churn.
-- **Reboot-resume.** Steps that need a reboot (e.g. `gpu-intel`) install a
+- **Reboot-resume.** Steps that need a reboot install a
   oneshot systemd unit; the run continues automatically after boot and cleans up
   after itself. A reboot-loop guard aborts instead of boot-cycling forever.
 - **Fail fast, resume cheap.** A failing command aborts its step (each step runs

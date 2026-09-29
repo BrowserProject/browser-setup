@@ -3,7 +3,7 @@
 # provision.sh - provision a node over SSH with one command.
 #
 #   ./provision.sh root@1.2.3.4 --role worker --tailscale-key tskey-auth-...
-#   ./provision.sh root@1.2.3.4 --role worker --modules gpu-intel,deadssd
+#   ./provision.sh root@1.2.3.4 --role worker --modules deadssd
 #   ./provision.sh root@1.2.3.4 --role db --secrets-file ./secrets.env
 #   ./provision.sh root@1.2.3.4 --role worker --server 100.x.y.z   # new/other control plane
 #   ./provision.sh root@1.2.3.4 --role control-plane --cluster-env ./cluster.env --manifests ./manifests
@@ -29,7 +29,7 @@
 # Generate a tailscale auth key at https://login.tailscale.com/admin/settings/keys
 # (keys expire; pass one per run, they are never stored here).
 #
-# If a step needs a reboot (e.g. gpu-intel), the node reboots and FINISHES ON
+# If a step needs a reboot, the node reboots and FINISHES ON
 # ITS OWN via node-setup-resume.service. Check with: ssh <node> node-setup status
 set -euo pipefail
 
