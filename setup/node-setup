@@ -188,6 +188,15 @@ load_environment() {
       esac
     done
   fi
+
+  # A --only/--skip name outside this plan would skip every step and still
+  # report success.
+  local step names=()
+  IFS=, read -ra names <<< "${ONLY_STEPS},${SKIP_STEPS}"
+  for step in "${names[@]}"; do
+    [[ -z "$step" ]] || in_list "$step" "${ROLE_STEPS[@]}" \
+      || die "--only/--skip: '$step' is not a step of role $ROLE (see: node-setup steps --role $ROLE)"
+  done
 }
 
 # --- completion --------------------------------------------------------------------

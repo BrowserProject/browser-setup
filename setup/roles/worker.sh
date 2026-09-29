@@ -13,6 +13,7 @@ ROLE_STEPS=(
   base-unattended
   base-ssh-harden
   swap-disable
+  session-limits
   tailscale-install
   tailscale-up
   docker-install
@@ -22,7 +23,6 @@ ROLE_STEPS=(
   flannel-watchdog
   oom-guards
   net-limits
-  session-limits
   hw-watchdog
   disk-guard
 )

@@ -96,6 +96,20 @@ if NODE_SETUP_STATE_DIR="$SB/state" NODE_SETUP_CONF_DIR="$SB/conf" \
 else
   ok "non-IP --server rejected"
 fi
+# Fresh sandbox: the runs above persisted their (invalid) node.conf.
+rm -rf "$SB"; SB="$(mktemp -d)"
+if NODE_SETUP_STATE_DIR="$SB/state" NODE_SETUP_CONF_DIR="$SB/conf" \
+   "$INFRA/setup/node-setup" --role worker --only no-such-step --dry-run --yes >/dev/null 2>&1; then
+  fail "an --only step outside the plan should be rejected"
+else
+  ok "--only step outside the plan rejected"
+fi
+if NODE_SETUP_STATE_DIR="$SB/state" NODE_SETUP_CONF_DIR="$SB/conf" \
+   "$INFRA/setup/node-setup" --role worker --only session-limits --dry-run --yes >/dev/null 2>&1; then
+  ok "--only step of the plan accepted"
+else
+  fail "an --only step of the plan should be accepted"
+fi
 rm -rf "$SB"
 
 echo "== 4. pristine-container dry-run (fresh node simulation) =="
