@@ -11,6 +11,9 @@
 # The k3s-flannel watchdog now lives in flannel-watchdog.sh; keeping it there avoids two
 # services racing to restart k3s.
 #
+# With --direct it applies only the tuning and removes the routing: Docker then
+# egresses through the host's own address (the direct-egress module).
+#
 # Idempotent: safe to re-run.
 #
 # Rollback:
@@ -39,6 +42,13 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [tailscale-exitnode] $*"; }
 die() { echo "$(date '+%Y-%m-%d %H:%M:%S') [tailscale-exitnode] ERROR: $*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "must run as root"
+
+MODE="exitnode"
+case "${1:-}" in
+    "") ;;
+    --direct) MODE="direct" ;;
+    *) die "usage: exitnode-routing.sh [--direct]" ;;
+esac
 
 # 1. SYSCTL TUNING
 # Default kernel socket buffers (208 KiB) are too small for Tailscale userspace
@@ -539,6 +549,14 @@ EOF
 
 apply_sysctl
 reset_routing
+
+if [[ "${MODE}" == "direct" ]]; then
+    tailscale set --exit-node= 2>/dev/null || true
+    log "direct egress: Docker leaves through the host's own address"
+    log "SUCCESS"
+    exit 0
+fi
+
 apply_routing
 
 # VERIFY

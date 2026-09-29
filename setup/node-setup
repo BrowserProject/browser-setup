@@ -48,7 +48,7 @@ export PAYLOAD_DIR MANIFEST_DIR VERSIONS_FILE CLUSTER_ENV_FILE
 source "$SETUP_DIR/lib/framework.sh"
 
 ROLES=(worker gateway control-plane db)
-OPTIONAL_MODULES=(gpu-intel deadssd)
+OPTIONAL_MODULES=(gpu-intel deadssd direct-egress)
 
 usage() { sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -131,6 +131,7 @@ guided_setup() {
       local hint=""
       [[ "$m" == "gpu-intel"  ]] && hint="(Hetzner iGPU nodes: unblacklist i915, needs a reboot)"
       [[ "$m" == "deadssd"    ]] && hint="(dying-disk nodes only: containerd on tmpfs)"
+      [[ "$m" == "direct-egress" ]] && hint="(workers whose sessions leave through their own address, no Mullvad)"
       local reply
       read -r -p "Enable optional module '$m' $hint? [y/N] " reply
       [[ "$reply" =~ ^[Yy] ]] && mods+=("$m")
@@ -185,6 +186,12 @@ load_environment() {
       case "$mod" in
         gpu-intel) ROLE_STEPS+=(gpu-intel) ;;
         deadssd)   ROLE_STEPS+=(deadssd-tmpfs) ;;
+        direct-egress)
+          local steps=() step
+          for step in "${ROLE_STEPS[@]}"; do
+            [[ "$step" == exitnode-routing ]] || steps+=("$step")
+          done
+          ROLE_STEPS=("${steps[@]}" direct-egress) ;;
       esac
     done
   fi
