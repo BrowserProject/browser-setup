@@ -23,7 +23,7 @@ tailscale-install tailscale-up
 docker-install docker-daemon-config
 ufw-rules
 k3s-agent-install
-flannel-watchdog oom-guards net-limits hw-watchdog disk-guard
+flannel-watchdog oom-guards net-limits session-limits hw-watchdog disk-guard
 [exitnode-routing]          # when EXITNODE_ROUTING=1 in cluster.env
 ```
 

@@ -87,6 +87,29 @@ net-limits::verify() {
   [[ "$(sysctl -n net.ipv4.neigh.default.gc_thresh3 2>/dev/null)" == "8192" ]]
 }
 
+# --- per-user limits of the browser sessions ------------------------------------------
+# Every browser container runs its desktop as the same uid (911), so a per-user
+# kernel limit is one budget for all sessions of the node. Each session holds
+# about five inotify instances (two dbus daemons, the browser, Selkies,
+# pulseaudio); the default of 128 runs out at about 25 sessions, and Selkies
+# then fails its start in a loop. The edge checks the value at boot.
+STEP_DESC["session-limits"]="raise the per-user inotify instance limit the browser sessions share"
+session-limits::check() {
+  grep -qxF 'fs.inotify.max_user_instances = 8192' /etc/sysctl.d/92-node-setup-session-limits.conf 2>/dev/null &&
+    [[ "$(sysctl -n fs.inotify.max_user_instances)" == "8192" ]]
+}
+session-limits::apply() {
+  write_if_changed /etc/sysctl.d/92-node-setup-session-limits.conf <<'EOF' || true
+# Managed by node-setup (session-limits).
+# Every browser session runs as uid 911; this is the budget of all of them.
+fs.inotify.max_user_instances = 8192
+EOF
+  sysctl -p /etc/sysctl.d/92-node-setup-session-limits.conf >/dev/null
+}
+session-limits::verify() {
+  [[ "$(sysctl -n fs.inotify.max_user_instances)" == "8192" ]]
+}
+
 # --- hardware watchdog ---------------------------------------------------------------
 # A hard kernel hang otherwise leaves the node down until someone notices.
 # With a watchdog device, systemd pets /dev/watchdog and the board reboots the

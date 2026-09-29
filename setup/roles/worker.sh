@@ -22,6 +22,7 @@ ROLE_STEPS=(
   flannel-watchdog
   oom-guards
   net-limits
+  session-limits
   hw-watchdog
   disk-guard
 )
