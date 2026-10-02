@@ -21,7 +21,7 @@ base-packages base-time base-journald base-unattended base-ssh-harden
 swap-disable session-limits
 tailscale-install tailscale-up
 docker-install docker-daemon-config
-ufw-rules
+ufw-rules session-isolation
 k3s-agent-install
 flannel-watchdog oom-guards net-limits hw-watchdog disk-guard
 [exitnode-routing]          # when EXITNODE_ROUTING=1 in cluster.env

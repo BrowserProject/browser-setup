@@ -19,6 +19,7 @@ ROLE_STEPS=(
   docker-install
   docker-daemon-config
   ufw-rules
+  session-isolation
   k3s-agent-install
   flannel-watchdog
   oom-guards
