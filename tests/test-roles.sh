@@ -217,6 +217,20 @@ oom_check_rc() {
 if ! oom_check_rc; then ok "oom-guards: an existing unit without the drop-in fails the check"; else fail "oom-guards check passed without a drop-in"; fi
 mkdir -p "$SB/k3s-agent.service.d" && touch "$SB/k3s-agent.service.d/90-oom.conf"
 if oom_check_rc; then ok "oom-guards: the drop-in on every existing unit passes the check"; else fail "oom-guards check failed with the drop-in"; fi
+rm -rf "$SB"; SB="$(mktemp -d)"
+(
+  source "$INFRA/setup/lib/framework.sh"
+  eval "$(sed "s#/etc/systemd/system#$SB#g" "$INFRA/setup/modules/resilience.sh")"
+  STATE_DIR="$SB"
+  systemctl() { [[ "$1 $2" == "cat k3s-agent.service" || "$1 $2" == "cat ssh.service" ]]; }
+  _run_fn oom-guards::apply
+) >/dev/null 2>&1
+if grep -qx 'OOMScoreAdjust=-900' "$SB/k3s-agent.service.d/90-oom.conf" 2>/dev/null \
+   && [[ -f "$SB/ssh.service.d/90-oom.conf" && ! -e "$SB/docker.service.d" ]]; then
+  ok "oom-guards: apply writes the drop-in for every existing guarded unit, none for absent ones"
+else
+  fail "oom-guards apply drop-ins: $(cd "$SB" && find . -name 90-oom.conf | sort | tr '\n' ' ')"
+fi
 rm -rf "$SB"
 
 echo "== 3f. --prepare (disk image bake) =="
