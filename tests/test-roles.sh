@@ -112,6 +112,17 @@ else
 fi
 rm -rf "$SB"
 
+echo "== 3d. alt-tailscale-port runs right after the tailnet join =="
+SB="$(mktemp -d)"
+out="$(NODE_SETUP_STATE_DIR="$SB/state" NODE_SETUP_CONF_DIR="$SB/conf" NO_COLOR=1 \
+      "$INFRA/setup/node-setup" steps --role worker --modules alt-tailscale-port 2>&1)"
+if grep -A1 -w 'tailscale-up' <<< "$out" | grep -qw 'tailscale-alt-port'; then
+  ok "tailscale-alt-port follows tailscale-up"
+else
+  fail "tailscale-alt-port placement"; echo "$out" | tail -5
+fi
+rm -rf "$SB"
+
 echo "== 4. pristine-container dry-run (fresh node simulation) =="
 if docker info >/dev/null 2>&1; then
   IMG="ubuntu:24.04"

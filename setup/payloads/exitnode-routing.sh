@@ -212,7 +212,10 @@ PRIORITY_BYPASS=5100
 DOCKER_NETWORK="172.17.0.0/16"
 TAILSCALE_CGNAT="100.64.0.0/10"
 FLANNEL_NETWORK="10.42.0.0/16"
-TAILSCALE_PORT=41641
+# Every port a tailscaled in the fleet listens on: the default and the
+# alt-tailscale-port module's (mirrored from setup/modules/tailscale.sh
+# TAILSCALE_ALT_PORT. Keep in sync.)
+TAILSCALE_PORTS="41641 41700"
 
 # ---- tunables ----
 RECONCILE_INTERVAL=5          # seconds between ip/iptables reconciliations
@@ -277,13 +280,16 @@ reconcile_rules() {
     ensure_rule "${PRIORITY_TAILSCALE_PEERS}" to "${TAILSCALE_CGNAT}"      lookup 52
     ensure_rule "${PRIORITY_BYPASS}"          not from "${DOCKER_NETWORK}" lookup main
 
-    # Tailscale-over-flannel recursion guard. Three rules: stop sending UDP/41641
-    # to overlay IPs (REJECT so magicsock learns the path is dead immediately),
-    # and silently drop incoming UDP/41641 on flannel.1 / cni0 (these would only
-    # arrive as a result of a peer's broken recursive path).
-    ensure_iptables_rule OUTPUT -d "${FLANNEL_NETWORK}" -p udp --dport "${TAILSCALE_PORT}" -j REJECT --reject-with icmp-port-unreachable -m comment --comment "block tailscale recursion via flannel"
-    ensure_iptables_rule INPUT  -i flannel.1 -p udp --dport "${TAILSCALE_PORT}" -j DROP -m comment --comment "block tailscale recursion via flannel"
-    ensure_iptables_rule INPUT  -i cni0      -p udp --dport "${TAILSCALE_PORT}" -j DROP -m comment --comment "block tailscale recursion via cni0"
+    # Tailscale-over-flannel recursion guard, per tailscale port. Three rules:
+    # stop sending to overlay IPs (REJECT so magicsock learns the path is dead
+    # immediately), and silently drop incoming on flannel.1 / cni0 (these would
+    # only arrive as a result of a peer's broken recursive path).
+    local port
+    for port in ${TAILSCALE_PORTS}; do
+        ensure_iptables_rule OUTPUT -d "${FLANNEL_NETWORK}" -p udp --dport "${port}" -j REJECT --reject-with icmp-port-unreachable -m comment --comment "block tailscale recursion via flannel"
+        ensure_iptables_rule INPUT  -i flannel.1 -p udp --dport "${port}" -j DROP -m comment --comment "block tailscale recursion via flannel"
+        ensure_iptables_rule INPUT  -i cni0      -p udp --dport "${port}" -j DROP -m comment --comment "block tailscale recursion via cni0"
+    done
 }
 
 # ---- known-bad-node set (avoid re-pinning a node that keeps failing) ----

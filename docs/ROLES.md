@@ -29,7 +29,9 @@ flannel-watchdog oom-guards net-limits hw-watchdog disk-guard
 
 Optional modules: `deadssd` (tmpfs mitigation for a dying disk), `direct-egress` (worker
 sessions leave through the node's own address: replaces `exitnode-routing`,
-keeps its sysctl tuning, clears any exit node).
+keeps its sysctl tuning, clears any exit node), `alt-tailscale-port` (tailscaled on UDP
+41700 instead of 41641, right after `tailscale-up`, for providers whose DDoS filter drops
+WireGuard on 41641; ZAP-Hosting does).
 
 ## gateway
 
