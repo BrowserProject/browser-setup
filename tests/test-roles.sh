@@ -330,6 +330,84 @@ else
 fi
 rm -rf "$SB"
 
+echo "== 3g. browser-images-prefetch =="
+SB="$(mktemp -d)"
+# shellcheck disable=SC1091
+prefetch() { # prefetch step-fn BAKE_IMAGES [REGISTRY_SERVER] -> rc; docker calls in $SB/docker.log
+  (
+    source "$INFRA/setup/lib/framework.sh"
+    source "$INFRA/setup/modules/browser-images.sh"
+    STATE_DIR="$SB"
+    RUN_DIR="$SB/run"
+    BAKE_IMAGES="$2"
+    if [[ -n "${3:-}" ]]; then REGISTRY_SERVER="$3"; REGISTRY_USER="burst-bake"; REGISTRY_PASSWORD="pw-secret"; fi
+    docker() {
+      case "$1" in
+        login)  cat > "$DOCKER_CONFIG/config.json"
+                [[ "$DOCKER_CONFIG" == "$RUN_DIR"/* ]] && echo "$* (tmpfs config)" >> "$SB/docker.log" ;;
+        image)  grep -qxF "$3" "$SB/present" 2>/dev/null ;;
+        pull)   echo "$*" >> "$SB/docker.log"; echo "$3" >> "$SB/present" ;;
+        tag)    echo "$*" >> "$SB/docker.log"; echo "$3" >> "$SB/present" ;;
+        *)      echo "$*" >> "$SB/docker.log" ;;
+      esac
+    }
+    retry() { shift 2; "$@"; }
+    _run_fn "$1"
+  ) >"$SB/out" 2>&1
+}
+calls() { paste -sd'|' "$SB/docker.log" 2>/dev/null; }
+reset_prefetch() { rm -rf "$SB/docker.log" "$SB/present" "$SB/run" "$SB/out"; }
+
+prefetch browser-images-prefetch::apply "srv.zesiger.net/browser-webrtc:beta-chrome curlimages/curl:8.22.0" beta.srv.zesiger.net
+want="login beta.srv.zesiger.net --username burst-bake --password-stdin (tmpfs config)"
+want+="|pull -q beta.srv.zesiger.net/browser-webrtc:beta-chrome"
+want+="|tag beta.srv.zesiger.net/browser-webrtc:beta-chrome srv.zesiger.net/browser-webrtc:beta-chrome"
+want+="|rmi beta.srv.zesiger.net/browser-webrtc:beta-chrome"
+want+="|pull -q curlimages/curl:8.22.0"
+want+="|logout beta.srv.zesiger.net"
+if [[ "$(calls)" == "$want" ]]; then
+  ok "prefetch pulls through REGISTRY_SERVER, names the image as the catalog does, Docker Hub anonymously"
+else
+  fail "prefetch docker calls: got '$(calls)', want '$want'"
+fi
+if [[ -z "$(find "$SB/run" -mindepth 1 2>/dev/null)" ]] && ! grep -rqs pw-secret "$SB/run" "$SB/docker.log" "$SB/out"; then
+  ok "prefetch leaves no registry credentials behind"
+else
+  fail "prefetch left credentials behind"
+fi
+if prefetch browser-images-prefetch::check "srv.zesiger.net/browser-webrtc:beta-chrome curlimages/curl:8.22.0"; then
+  ok "prefetch check passes once every reference inspects"
+else
+  fail "prefetch check after the pulls"
+fi
+if ! prefetch browser-images-prefetch::check "srv.zesiger.net/browser-webrtc:beta-tor"; then
+  ok "prefetch check fails for a missing reference"
+else
+  fail "prefetch check passed for a missing reference"
+fi
+reset_prefetch
+digest="srv.zesiger.net/browser-profile-tool@sha256:$(printf '0%.0s' {1..64})"
+if ! prefetch browser-images-prefetch::apply "$digest" beta.srv.zesiger.net \
+   && grep -q "a digest cannot be renamed" "$SB/out" && [[ -z "$(calls)" ]]; then
+  ok "prefetch refuses a digest it would have to rename, before any login"
+else
+  fail "prefetch with a digest on another registry: rc ok or calls '$(calls)'"
+fi
+reset_prefetch
+if prefetch browser-images-prefetch::apply "$digest" srv.zesiger.net \
+   && [[ "$(calls)" == "login srv.zesiger.net --username burst-bake --password-stdin (tmpfs config)|pull -q $digest|logout srv.zesiger.net" ]]; then
+  ok "prefetch pulls a digest from its own registry unchanged"
+else
+  fail "prefetch with a digest on REGISTRY_SERVER: calls '$(calls)'"
+fi
+reset_prefetch
+if prefetch browser-images-prefetch::apply "" && [[ -z "$(calls)" ]]; then
+  ok "prefetch without BAKE_IMAGES needs no registry and pulls nothing"
+else
+  fail "prefetch without BAKE_IMAGES: calls '$(calls)'"; tail -3 "$SB/out"
+fi
+rm -rf "$SB"
+
 echo "== 4. pristine-container dry-run (fresh node simulation) =="
 if docker info >/dev/null 2>&1; then
   IMG="ubuntu:24.04"

@@ -30,6 +30,7 @@ ROLE_STEPS=(
   net-limits
   hw-watchdog
   disk-guard
+  browser-images-prefetch
 )
 
 # Workers route Docker traffic through a Mullvad exit node (prod).
