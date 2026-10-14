@@ -12,7 +12,14 @@ completion**.
 | `TS_AUTHKEY` | worker, gateway, control-plane, db | Tailscale join key (expires; pass one per run) |
 | `K3S_TOKEN` | worker, gateway, control-plane | k3s cluster join token |
 | `REGISTRY_SERVER` `REGISTRY_USER` `REGISTRY_PASSWORD` `REGISTRY_EMAIL` | control-plane | private image registry pull secret |
+| `REGISTRY_SERVER` `REGISTRY_USER` `REGISTRY_PASSWORD`, `BAKE_IMAGES` | worker `--prepare` | pull-only registry key and the image list of a browser image bake (`browser-images-prefetch`); `BAKE_IMAGES` is not secret |
 | `PG_BROWSER_PASSWORD` `PG_GUARD_PASSWORD` | db | PostgreSQL role passwords |
+
+A `--prepare` run (disk image bake) needs no `TS_AUTHKEY` and no `K3S_TOKEN`:
+the steps that use them run when a node boots from the image. `node-setup seal`
+refuses to seal a disk that still holds `secrets.env`, a registry login or any
+file outside the bundle assigning `REGISTRY_PASSWORD`, `TS_AUTHKEY` or
+`K3S_TOKEN`.
 
 `TS_AUTHKEY` is deliberately never stored anywhere at rest - generate one per run
 at <https://login.tailscale.com/admin/settings/keys> (or mint an ephemeral key
