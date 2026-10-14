@@ -218,27 +218,46 @@ if ! oom_check_rc; then ok "oom-guards: an existing unit without the drop-in fai
 mkdir -p "$SB/k3s-agent.service.d" && touch "$SB/k3s-agent.service.d/90-oom.conf"
 if oom_check_rc; then ok "oom-guards: the drop-in on every existing unit passes the check"; else fail "oom-guards check failed with the drop-in"; fi
 rm -rf "$SB"; SB="$(mktemp -d)"
+# One sandbox, two applies: the first writes and reloads, the re-run writes
+# nothing and does not reload; verify passes. The postgresql@ template gets
+# its drop-in but is never asked for a live MainPID.
 (
   source "$INFRA/setup/lib/framework.sh"
   eval "$(sed "s#/etc/systemd/system#$SB#g" "$INFRA/setup/modules/resilience.sh")"
   STATE_DIR="$SB"
   systemctl() {
     case "$1 ${2:-}" in
-      'cat k3s-agent.service'|'cat ssh.service') return 0 ;;
+      'cat k3s-agent.service'|'cat ssh.service'|'cat postgresql@.service') return 0 ;;
       'daemon-reload '*) touch "$SB/reloaded" ;;
-      'show '*) echo 0 ;;
+      'show '*) echo "${*: -1}" >> "$SB/shown"; echo 0 ;;
       *) return 1 ;;
     esac
   }
-  _run_fn oom-guards::apply; echo $? > "$SB/rc"
+  _run_fn oom-guards::apply; echo $? > "$SB/rc1"
+  [[ -f "$SB/reloaded" ]] && touch "$SB/reloaded1"
+  rm -f "$SB/reloaded"
+  _run_fn oom-guards::apply; echo $? > "$SB/rc2"
+  _run_fn oom-guards::verify; echo $? > "$SB/rc-verify"
 ) >/dev/null 2>&1
-if [[ "$(cat "$SB/rc" 2>/dev/null)" == 0 && -f "$SB/reloaded" ]] \
+if [[ "$(cat "$SB/rc1" 2>/dev/null)" == 0 && -f "$SB/reloaded1" ]] \
    && grep -qx 'OOMScoreAdjust=-900' "$SB/k3s-agent.service.d/90-oom.conf" 2>/dev/null \
    && grep -qx 'OOMScoreAdjust=-900' "$SB/ssh.service.d/90-oom.conf" 2>/dev/null \
+   && grep -qx 'OOMScoreAdjust=-900' "$SB/postgresql@.service.d/90-oom.conf" 2>/dev/null \
    && [[ ! -e "$SB/docker.service.d" ]]; then
   ok "oom-guards: apply succeeds, reloads systemd, writes the drop-in for every existing guarded unit and none for absent ones"
 else
-  fail "oom-guards apply: rc=$(cat "$SB/rc" 2>/dev/null) reloaded=$([[ -f "$SB/reloaded" ]] && echo yes || echo no) drop-ins: $(cd "$SB" && find . -name 90-oom.conf | sort | tr '\n' ' ')"
+  fail "oom-guards apply: rc=$(cat "$SB/rc1" 2>/dev/null) reloaded=$([[ -f "$SB/reloaded1" ]] && echo yes || echo no) drop-ins: $(cd "$SB" && find . -name 90-oom.conf | sort | tr '\n' ' ')"
+fi
+if [[ "$(cat "$SB/rc2" 2>/dev/null)" == 0 && ! -e "$SB/reloaded" ]]; then
+  ok "oom-guards: a re-run writes nothing, does not reload systemd and succeeds"
+else
+  fail "oom-guards re-run: rc=$(cat "$SB/rc2" 2>/dev/null) reloaded=$([[ -e "$SB/reloaded" ]] && echo yes || echo no)"
+fi
+if [[ "$(cat "$SB/rc-verify" 2>/dev/null)" == 0 ]]; then ok "oom-guards: verify passes after apply"; else fail "oom-guards verify failed after apply"; fi
+if grep -qx 'k3s-agent.service' "$SB/shown" 2>/dev/null && ! grep -q '^postgresql@' "$SB/shown"; then
+  ok "oom-guards: the live-PID pass skips the postgresql@ template"
+else
+  fail "oom-guards live-PID pass queried: $(tr '\n' ' ' < "$SB/shown" 2>/dev/null)"
 fi
 rm -rf "$SB"
 
