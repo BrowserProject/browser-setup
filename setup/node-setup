@@ -8,9 +8,15 @@
 #   node-setup --role worker --server 100.x.y.z # join a specific control plane
 #   node-setup doctor                           # read-only drift report for this node
 #   node-setup status                           # journal + node identity
-#   node-setup steps [--role X]                 # list the step plan
+#   node-setup steps [--role X] [--prepare]     # list the step plan
+#   node-setup --role worker --prepare --yes    # bake a disk image (no secrets, no identity)
 #
-# Flags: --yes  --dry-run  --server ip  --only step[,step]  --skip step[,step]  --resume
+# Flags: --yes  --dry-run  --server ip  --only step[,step]  --skip step[,step]  --resume  --prepare
+#
+# --prepare runs every step except the boot steps (tailscale join, k3s join)
+# plus the bake steps (k3s pre-install, browser image prefetch) and journals
+# them, so a node booted from the image and run normally with the same bundle
+# and cluster.env applies only the boot steps.
 #
 # Roles: worker | gateway | control-plane | db
 # (the registry host and the dev server are NOT managed here; the dev server
@@ -50,7 +56,7 @@ source "$SETUP_DIR/lib/framework.sh"
 ROLES=(worker gateway control-plane db)
 OPTIONAL_MODULES=(deadssd direct-egress)
 
-usage() { sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n "3,/^set /{/^#/s/^# \{0,1\}//p}" "$0"; }
 
 # --- argument parsing ---------------------------------------------------------
 CMD="apply"
@@ -70,11 +76,16 @@ while [[ $# -gt 0 ]]; do
     --yes|-y)   ASSUME_YES=1 ;;
     --dry-run)  DRY_RUN=1 ;;
     --resume)   RESUME=1; ASSUME_YES=1 ;;
+    --prepare)  RUN_PHASE=prepare ;;
     -h|--help)  usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
   shift
 done
+
+if [[ "$RUN_PHASE" == "prepare" && "$CMD" != "apply" && "$CMD" != "steps" ]]; then
+  die "--prepare applies to a provisioning run or 'steps', not '$CMD'"
+fi
 
 [[ -t 0 && "$ASSUME_YES" != "1" ]] && INTERACTIVE=1
 
@@ -176,6 +187,9 @@ load_environment() {
   done
   # shellcheck disable=SC1090
   source "$SETUP_DIR/roles/$ROLE.sh"
+  if [[ "$RUN_PHASE" == "prepare" && "${ROLE_PREPARABLE:-0}" != "1" ]]; then
+    die "role $ROLE cannot be prepared as a disk image (--prepare is for: worker)"
+  fi
 
   # A malformed label would only surface after the k3s install, as an agent
   # that never registers; the installer also splits INSTALL_K3S_EXEC on spaces.
@@ -204,13 +218,17 @@ load_environment() {
     done
   fi
 
-  # A --only/--skip name outside this plan would skip every step and still
-  # report success.
-  local step names=()
+  # A --only/--skip name outside this plan, or of the other phase, would skip
+  # every step and still report success.
+  local step names=() phase_reason
   IFS=, read -ra names <<< "${ONLY_STEPS},${SKIP_STEPS}"
   for step in "${names[@]}"; do
-    [[ -z "$step" ]] || in_list "$step" "${ROLE_STEPS[@]}" \
+    [[ -z "$step" ]] && continue
+    in_list "$step" "${ROLE_STEPS[@]}" \
       || die "--only/--skip: '$step' is not a step of role $ROLE (see: node-setup steps --role $ROLE)"
+    phase_reason="$(_phase_skip_reason "$step")"
+    [[ -z "$phase_reason" ]] \
+      || die "--only/--skip: '$step' never runs in this run (${phase_reason}; see: node-setup steps --role $ROLE)"
   done
 }
 
@@ -224,6 +242,11 @@ finish_run() {
   # convenience: make `node-setup` available on PATH for doctor/status later
   ln -sf "$NODE_SETUP_BIN" /usr/local/bin/node-setup
   echo
+  if [[ "$RUN_PHASE" == "prepare" ]]; then
+    ok "image prepared: role=$ROLE"
+    ok "next, before the snapshot: node-setup seal [--poweroff]"
+    return 0
+  fi
   ok "provisioning complete: role=$ROLE"
   if [[ "$ROLE" == "control-plane" ]]; then
     ok "workers join this control plane with: node-setup --role worker --server $(ts_ip)"
@@ -249,6 +272,9 @@ cmd_apply() {
   load_secrets
 
   log "plan: ${ROLE_STEPS[*]}"
+  if [[ "$RUN_PHASE" == "prepare" ]]; then
+    log "phase: prepare (disk image; boot steps are skipped)"
+  fi
   if [[ "$ROLE" == "worker" || "$ROLE" == "gateway" ]]; then
     log "control plane: $K3S_SERVER_IP"
     log "node labels: ${K3S_NODE_LABELS[*]:-none}"
@@ -301,7 +327,8 @@ cmd_steps() {
   load_environment
   local s
   for s in "${ROLE_STEPS[@]}"; do
-    printf '%-28s %s\n' "$s" "${STEP_DESC[$s]:-}"
+    [[ -z "$(_phase_skip_reason "$s")" ]] || continue
+    printf '%-28s %-5s %s\n' "$s" "${STEP_PHASE[$s]:--}" "${STEP_DESC[$s]:-}"
   done
 }
 

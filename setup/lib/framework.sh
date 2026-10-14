@@ -5,7 +5,12 @@
 #   <step>::check    return 0 when the step's desired state already holds
 #   <step>::apply    idempotently establish the desired state (fail-fast)
 #   <step>::verify   read-only assertion that apply worked
-# plus a description in STEP_DESC[<step>].
+# plus a description in STEP_DESC[<step>] and, for a step that belongs to one
+# phase only, STEP_PHASE[<step>]:
+#   boot   needs secrets or the node's identity; never runs under --prepare
+#   bake   builds a reusable disk image; runs only under --prepare
+# Steps without a phase run in both. A --prepare run journals its steps like a
+# normal run, so a node booted from the image skips them (same hashes).
 #
 # The runner keeps a journal in $STATE_DIR/state/<step>.hash containing a hash
 # of the step's function bodies + versions.env. A step is skipped only when the
@@ -19,6 +24,7 @@
 
 # --- paths (overridable for tests) -------------------------------------------
 STATE_DIR="${NODE_SETUP_STATE_DIR:-/var/lib/node-setup}"
+RUN_DIR="${NODE_SETUP_RUN_DIR:-/run/node-setup}"   # tmpfs: never part of a disk image
 CONF_DIR="${NODE_SETUP_CONF_DIR:-/etc/node-setup}"
 LOG_FILE="$STATE_DIR/setup.log"
 
@@ -29,8 +35,10 @@ ASSUME_YES=0
 INTERACTIVE=0
 ONLY_STEPS=""
 SKIP_STEPS=""
+RUN_PHASE="apply"   # apply | prepare (image bake)
 
 declare -A STEP_DESC
+declare -A STEP_PHASE
 
 # --- output -------------------------------------------------------------------
 if [[ -t 1 && "${NO_COLOR:-}" != "1" ]]; then
@@ -251,23 +259,35 @@ _run_fn() {
   return "$rc"
 }
 
-_step_selected() {
-  local step="$1"
-  if [[ -n "$ONLY_STEPS" ]]; then
-    [[ ",$ONLY_STEPS," == *",$step,"* ]] || return 1
-  fi
-  [[ ",$SKIP_STEPS," == *",$step,"* ]] && return 1
-  return 0
+# Phase skip reason of a step in this run, empty when the phase runs it.
+_phase_skip_reason() {
+  case "$RUN_PHASE:${STEP_PHASE[$1]:-}" in
+    prepare:boot) echo "boot phase" ;;
+    apply:bake)   echo "bake phase" ;;
+  esac
 }
+
+# Why this run skips a step, empty when it runs.
+_step_skip_reason() {
+  local step="$1"
+  if [[ -n "$ONLY_STEPS" && ",$ONLY_STEPS," != *",$step,"* ]] || [[ ",$SKIP_STEPS," == *",$step,"* ]]; then
+    echo "--only/--skip"
+  else
+    _phase_skip_reason "$step"
+  fi
+}
+
+_step_selected() { [[ -z "$(_step_skip_reason "$1")" ]]; }
 
 # run_steps step...  -> exit code 0 done, 3 reboot pending (already rebooting)
 run_steps() {
-  local step hash state_file
+  local step hash state_file reason
   mkdir -p "$STATE_DIR/state" "$STATE_DIR/rebooted-for"
   chmod 700 "$STATE_DIR"   # step scripts serialize secrets through here
 
   for step in "$@"; do
-    _step_selected "$step" || { log "[$step] skipped (--only/--skip)"; continue; }
+    reason="$(_step_skip_reason "$step")"
+    if [[ -n "$reason" ]]; then log "[$step] skipped ($reason)"; continue; fi
     _has_fn "${step}::apply" || die "[$step] no such step (missing ${step}::apply)"
 
     hash="$(_step_hash "$step")"
@@ -335,8 +355,9 @@ _handle_reboot() {
 }
 
 install_resume_unit() {
-  local self
+  local self args="--resume"
   self="$(readlink -f "${NODE_SETUP_BIN:-$0}")"
+  [[ "$RUN_PHASE" == "prepare" ]] && args+=" --prepare"
   write_if_changed /etc/systemd/system/node-setup-resume.service <<EOF || true
 # Managed by node-setup: resumes a provisioning run interrupted by a reboot.
 # Removed automatically when the run completes.
@@ -347,7 +368,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$self --resume
+ExecStart=$self $args
 StandardOutput=journal
 StandardError=journal
 

@@ -120,6 +120,7 @@ exec_args="$(
   source "$SB/setup/modules/k3s-agent.sh"
   source "$SB/setup/roles/worker.sh"
   STATE_DIR="$SB"
+  K3S_INSTALLER_CACHE="$SB/no-cached-installer"
   require_secrets() { :; }
   ts_ip() { echo 100.64.0.9; }
   retry() { :; }
@@ -214,6 +215,121 @@ mkdir -p "$SB/k3s-agent.service.d" && touch "$SB/k3s-agent.service.d/90-oom.conf
 if oom_check_rc; then ok "oom-guards: the drop-in on every existing unit passes the check"; else fail "oom-guards check failed with the drop-in"; fi
 rm -rf "$SB"
 
+echo "== 3f. --prepare (disk image bake) =="
+SB="$(mktemp -d)"
+ns() { # ns args... -> sandboxed node-setup, output on stdout
+  NODE_SETUP_STATE_DIR="$SB/state" NODE_SETUP_CONF_DIR="$SB/conf" NO_COLOR=1 "$INFRA/setup/node-setup" "$@" 2>&1
+}
+steps_prepare="$(ns steps --role worker --prepare)"
+steps_apply="$(ns steps --role worker)"
+if grep -q '^k3s-agent-preinstall ' <<< "$steps_prepare" \
+   && ! grep -qE '^(tailscale-up|k3s-agent-install) ' <<< "$steps_prepare"; then
+  ok "steps --prepare lists the bake steps and no boot step"
+else
+  fail "steps --prepare"; echo "$steps_prepare"
+fi
+if grep -qE '^tailscale-up +boot ' <<< "$steps_apply" && ! grep -q '^k3s-agent-preinstall ' <<< "$steps_apply"; then
+  ok "steps lists the boot steps with their phase and no bake step"
+else
+  fail "steps without --prepare"; echo "$steps_apply"
+fi
+out="$(ns --role worker --prepare --dry-run --yes)"
+if grep -q "dry-run complete" <<< "$out" \
+   && grep -qF "[tailscale-up] skipped (boot phase)" <<< "$out" \
+   && grep -qF "[k3s-agent-install] skipped (boot phase)" <<< "$out" \
+   && grep -qF "[k3s-agent-preinstall] WOULD apply" <<< "$out"; then
+  ok "worker --prepare --dry-run skips the boot steps and runs the bake steps"
+else
+  fail "worker --prepare --dry-run"; echo "$out" | tail -5
+fi
+rm -rf "$SB"; SB="$(mktemp -d)"
+out="$(ns --role worker --dry-run --yes)"
+if grep -qF "[k3s-agent-preinstall] skipped (bake phase)" <<< "$out"; then
+  ok "a normal worker run skips the bake steps"
+else
+  fail "a normal worker run should skip the bake steps"; echo "$out" | tail -5
+fi
+for role in gateway control-plane db; do
+  rm -rf "$SB"; SB="$(mktemp -d)"
+  if out="$(ns --role "$role" --prepare --dry-run --yes)"; then
+    fail "--prepare should be refused for $role"
+  elif grep -q "cannot be prepared as a disk image" <<< "$out"; then
+    ok "--prepare refused for $role"
+  else
+    fail "--prepare for $role failed for another reason"; echo "$out" | tail -3
+  fi
+done
+rm -rf "$SB"; SB="$(mktemp -d)"
+refused() { # refused "name" args... -> the run must fail with a phase message
+  local name="$1" out; shift
+  if out="$(ns "$@")"; then fail "$name should be refused"
+  elif grep -q "never runs in this run" <<< "$out"; then ok "$name refused"
+  else fail "$name failed for another reason"; echo "$out" | tail -3; fi
+}
+refused "--prepare --only tailscale-up" --role worker --prepare --only tailscale-up --dry-run --yes
+refused "--only k3s-agent-preinstall without --prepare" --role worker --only k3s-agent-preinstall --dry-run --yes
+if ns doctor --prepare >/dev/null; then fail "doctor --prepare should be refused"; else ok "doctor --prepare refused"; fi
+rm -rf "$SB"
+
+# k3s split: the bake pre-installs without any join value, the boot join reuses
+# the cached installer and binary.
+SB="$(mktemp -d)"
+mkdir -p "$SB/bin"
+cat > "$SB/bin/sh" <<'EOF'
+#!/bin/bash
+printf 'script=%s token=%s url=%s enable=%s start=%s download=%s exec=%s\n' "$1" "${K3S_TOKEN:-unset}" "${K3S_URL:-unset}" \
+  "${INSTALL_K3S_SKIP_ENABLE:-}" "${INSTALL_K3S_SKIP_START:-}" "${INSTALL_K3S_SKIP_DOWNLOAD:-}" "$INSTALL_K3S_EXEC"
+EOF
+chmod +x "$SB/bin/sh"
+# shellcheck disable=SC1091
+k3s_step() { # k3s_step step installed-version -> what the installer was run with
+  (
+    source "$INFRA/setup/lib/framework.sh"
+    source "$INFRA/setup/versions.env"
+    source "$INFRA/setup/modules/k3s-agent.sh"
+    STATE_DIR="$SB"
+    K3S_INSTALLER_CACHE="$SB/k3s-install.sh"
+    K3S_NODE_LABELS=()
+    export K3S_URL="https://100.64.0.1:6443"
+    INSTALLED="$2"
+    export K3S_TOKEN="from-secrets"
+    PATH="$SB/bin:$PATH"
+    systemctl() { [[ -n "${JOINED:-}" && "$1" == is-active ]]; }
+    k3s() { [[ -n "$INSTALLED" ]] && echo "k3s version $INSTALLED (abc)"; }
+    curl() { [[ "$*" != *" -o "* ]] || echo installer > "$K3S_INSTALLER_CACHE"; }
+    require_secrets() { :; }
+    ts_ip() { echo 100.64.0.9; }
+    retry() { :; }
+    _run_fn "$1::apply"
+  ) 2>&1
+}
+pin="$(sed -n 's/^K3S_VERSION="\(.*\)"$/\1/p' "$INFRA/setup/versions.env")"
+out="$(k3s_step k3s-agent-preinstall "")"
+if [[ "$out" == "script=$SB/k3s-install.sh token=unset url=unset enable=true start=true download= exec=agent --flannel-iface=tailscale0" ]]; then
+  ok "k3s-agent-preinstall caches the installer and runs it without a join value, disabled"
+else
+  fail "k3s-agent-preinstall ran: $out"
+fi
+out="$(k3s_step k3s-agent-install "$pin")"
+if [[ "$out" == "script=$SB/k3s-install.sh token=from-secrets url=https://100.64.0.1:6443 enable= start= download=true exec=agent --node-ip=100.64.0.9 --flannel-iface=tailscale0" ]]; then
+  ok "k3s-agent-install joins through the cached installer when the pinned binary is present"
+else
+  fail "k3s-agent-install with a cached installer ran: $out"
+fi
+out="$(k3s_step k3s-agent-install "v0.0.1+k3s1")"
+if [[ "$out" == "script=- token=from-secrets url=https://100.64.0.1:6443 enable= start= download= exec=agent --node-ip=100.64.0.9 --flannel-iface=tailscale0" ]]; then
+  ok "k3s-agent-install downloads when the binary is not the pinned one"
+else
+  fail "k3s-agent-install with another binary ran: $out"
+fi
+out="$(JOINED=1 k3s_step k3s-agent-preinstall "$pin")"
+if grep -q "pre-install is for a fresh image bake only" <<< "$out" && ! grep -q "^script=" <<< "$out"; then
+  ok "k3s-agent-preinstall refuses a host whose agent has joined"
+else
+  fail "k3s-agent-preinstall on a joined host ran: $out"
+fi
+rm -rf "$SB"
+
 echo "== 4. pristine-container dry-run (fresh node simulation) =="
 if docker info >/dev/null 2>&1; then
   IMG="ubuntu:24.04"
@@ -231,6 +347,13 @@ if docker info >/dev/null 2>&1; then
           echo "  FAIL container dry-run $role"; tail -5 /tmp/out; fail=$((fail+1))
         fi
       done
+      rm -rf /var/lib/node-setup /etc/node-setup
+      if /bundle/setup/node-setup --role worker --prepare --dry-run --yes >/tmp/out 2>&1 \
+         && grep -q "dry-run complete" /tmp/out && grep -qF "[tailscale-up] skipped (boot phase)" /tmp/out; then
+        echo "  ok  container dry-run worker --prepare"; pass=$((pass+1))
+      else
+        echo "  FAIL container dry-run worker --prepare"; tail -5 /tmp/out; fail=$((fail+1))
+      fi
       echo "container: $pass ok, $fail failed"; [ "$fail" = 0 ]'
     if docker run --rm -v "$STAGE:/bundle:ro" "$IMG" bash -c "$SCRIPT"; then
       ok "pristine container dry-runs"

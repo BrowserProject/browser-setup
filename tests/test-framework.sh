@@ -139,6 +139,64 @@ t "skip: run ok"                   run_steps sel-a
 tf "skip: skipped step not run"    test -f "$SANDBOX/sel-a"
 SKIP_STEPS=""
 
+echo "== phases =="
+PHASE_LOG="$SANDBOX/phase-log"
+STEP_DESC[ph-any]="any phase";  ph-any::apply()  { echo any  >> "$PHASE_LOG"; }
+STEP_DESC[ph-boot]="boot phase"; ph-boot::apply() { echo boot >> "$PHASE_LOG"; }
+STEP_DESC[ph-bake]="bake phase"; ph-bake::apply() { echo bake >> "$PHASE_LOG"; }
+STEP_PHASE[ph-boot]=boot
+STEP_PHASE[ph-bake]=bake
+RUN_PHASE=prepare
+OUT="$(run_steps ph-any ph-boot ph-bake 2>&1)"
+t "prepare applies the any and bake steps"  test "$(paste -sd' ' "$PHASE_LOG")" = "any bake"
+t "prepare logs why the boot step is skipped" grep -qF "[ph-boot] skipped (boot phase)" <<< "$OUT"
+tf "prepare journals no boot step"         test -f "$NODE_SETUP_STATE_DIR/state/ph-boot.hash"
+rm -f "$PHASE_LOG"
+RUN_PHASE=apply
+OUT="$(run_steps ph-any ph-boot ph-bake 2>&1)"
+t "apply after prepare runs only the boot step" test "$(paste -sd' ' "$PHASE_LOG")" = "boot"
+t "apply logs why the bake step is skipped" grep -qF "[ph-bake] skipped (bake phase)" <<< "$OUT"
+tf "doctor leaves out the bake step"       grep -q "^ph-bake" <<< "$(doctor_steps ph-any ph-bake 2>/dev/null)"
+
+echo "== prepared journal in a later process (image boot) =="
+# Each run is a fresh bash process that sources the framework again, as a
+# node booted from the image does; the step hashes must match across them.
+IMG="$SANDBOX/img"
+mkdir -p "$IMG/state" "$IMG/conf" "$IMG/count"
+echo 'K3S_SERVER_IP="100.64.0.1"' > "$IMG/cluster.env"
+cat > "$IMG/steps.sh" <<'EOF'
+count() { echo $(( $(cat "$IMG/count/$1" 2>/dev/null || echo 0) + 1 )) > "$IMG/count/$1"; }
+STEP_DESC[img-checked]="has a check";    STEP_DESC[img-unchecked]="no check"
+STEP_DESC[img-boot]="join";              STEP_DESC[img-bake]="bake only"
+STEP_PHASE[img-boot]=boot;               STEP_PHASE[img-bake]=bake
+img-checked::check()  { [[ -f "$IMG/checked-state" ]]; }
+img-checked::apply()  { touch "$IMG/checked-state"; count img-checked; }
+img-unchecked::apply() { count img-unchecked; }
+img-boot::apply()     { count img-boot; }
+img-bake::apply()     { count img-bake; }
+EOF
+cat > "$IMG/run.sh" <<EOF
+source "$HERE/../setup/lib/framework.sh"
+IMG="$IMG"
+VERSIONS_FILE="$VERSIONS_FILE"
+CLUSTER_ENV_FILE="$IMG/cluster.env"
+source "$IMG/steps.sh"
+RUN_PHASE="\$1"
+run_steps img-checked img-unchecked img-boot img-bake
+EOF
+img_run() { NODE_SETUP_STATE_DIR="$IMG/state" NODE_SETUP_CONF_DIR="$IMG/conf" bash "$IMG/run.sh" "$1"; }
+counts() { local s out=""; for s in img-checked img-unchecked img-boot img-bake; do out+="$(cat "$IMG/count/$s" 2>/dev/null || echo 0) "; done; echo "${out% }"; }
+t "prepare run succeeds"                   img_run prepare
+t "prepare applied all but the boot step"  test "$(counts)" = "1 1 0 1"
+t "boot run succeeds"                      img_run apply
+t "boot run applied only the boot step"    test "$(counts)" = "1 1 1 1"
+rm "$IMG/checked-state"
+t "drift run succeeds"                     img_run apply
+t "drift re-applies the checked step"      test "$(counts)" = "2 1 1 1"
+echo 'K3S_SERVER_IP="100.64.0.2"' > "$IMG/cluster.env"
+t "changed cluster.env run succeeds"       img_run apply
+t "hash change: check adopts, no check re-applies" test "$(counts)" = "2 2 2 1"
+
 echo "== doctor =="
 OUT="$(doctor_steps s1 2>/dev/null)"
 t "doctor lists step"              grep -q "^s1" <<< "$OUT"
