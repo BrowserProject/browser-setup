@@ -177,6 +177,16 @@ load_environment() {
   # shellcheck disable=SC1090
   source "$SETUP_DIR/roles/$ROLE.sh"
 
+  # A malformed label would only surface after the k3s install, as an agent
+  # that never registers; the installer also splits INSTALL_K3S_EXEC on spaces.
+  if [[ "$ROLE" == "worker" || "$ROLE" == "gateway" ]]; then
+    local label label_re='^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?=([A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?$'
+    for label in "${K3S_NODE_LABELS[@]}"; do
+      [[ "$label" =~ $label_re ]] \
+        || die "node label '$label' is not a Kubernetes key=value label (WORKER_NODE_LABELS in cluster.env)"
+    done
+  fi
+
   # append opted-in extra modules to the role's step list
   if [[ -n "$EXTRA_MODULES" ]]; then
     local IFS=','

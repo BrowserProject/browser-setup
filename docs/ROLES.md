@@ -31,6 +31,10 @@ Optional modules: `deadssd` (tmpfs mitigation for a dying disk), `direct-egress`
 sessions leave through the node's own address: replaces `exitnode-routing`,
 keeps its sysctl tuning, clears any exit node).
 
+Node labels come from `WORKER_NODE_LABELS` in `cluster.env` (empty by default);
+k3s applies them when the worker registers, so a later edit does not relabel a
+worker that already joined.
+
 ## gateway
 
 Public-facing agent; same shape as `worker` with public 80/443.

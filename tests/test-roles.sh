@@ -82,22 +82,25 @@ if [[ -n "$DEFAULT_IP" ]] && grep -qxF "[setup] control plane: $DEFAULT_IP" <<< 
 else
   fail "default control plane IP"; echo "$out" | tail -3
 fi
-if grep -qxF "[setup] node labels: none" <<< "$out"; then
-  ok "a worker without WORKER_NODE_LABELS gets no node labels"
-else
-  fail "default worker node labels"; echo "$out" | tail -3
-fi
 rm -rf "$SB"
 
 echo "== 3c. WORKER_NODE_LABELS from cluster.env =="
 SB="$(mktemp -d)"
 cp -a "$INFRA/setup" "$SB/setup"
 cp "$SB/setup/cluster.env.example" "$SB/setup/cluster.env"
+labels_of() { # labels_of role -> the "node labels:" line of a sandboxed dry-run
+  NODE_SETUP_STATE_DIR="$SB/state-$1" NODE_SETUP_CONF_DIR="$SB/conf-$1" NO_COLOR=1 \
+    "$SB/setup/node-setup" --role "$1" --dry-run --yes 2>&1 | sed -n 's/^\[setup\] node labels: //p'
+}
+labels="$(labels_of worker)"
+if [[ "$labels" == "none" ]]; then
+  ok "the template gives a worker no node labels"
+else
+  fail "template worker node labels: got '$labels', want 'none'"
+fi
 echo 'WORKER_NODE_LABELS=("browser.lol/burst=true" "example.com/tier=a")' >> "$SB/setup/cluster.env"
 for role in worker gateway; do
-  out="$(NODE_SETUP_STATE_DIR="$SB/state-$role" NODE_SETUP_CONF_DIR="$SB/conf-$role" NO_COLOR=1 \
-        "$SB/setup/node-setup" --role "$role" --dry-run --yes 2>&1)"
-  labels="$(sed -n 's/^\[setup\] node labels: //p' <<< "$out")"
+  labels="$(labels_of "$role")"
   case "$role" in
     worker)  want="browser.lol/burst=true example.com/tier=a" ;;
     gateway) want="type=gateway" ;;
@@ -105,9 +108,31 @@ for role in worker gateway; do
   if [[ "$labels" == "$want" ]]; then
     ok "$role node labels: $labels"
   else
-    fail "$role node labels: got '$labels', want '$want'"; echo "$out" | tail -3
+    fail "$role node labels: got '$labels', want '$want'"
   fi
 done
+# The agent install must hand every label to k3s as its own --node-label,
+# through the child shell the framework runs each step in.
+# shellcheck disable=SC1091
+exec_args="$(
+  source "$SB/setup/lib/framework.sh"
+  source "$SB/setup/cluster.env"
+  source "$SB/setup/modules/k3s-agent.sh"
+  source "$SB/setup/roles/worker.sh"
+  STATE_DIR="$SB"
+  require_secrets() { :; }
+  ts_ip() { echo 100.64.0.9; }
+  retry() { :; }
+  curl() { :; }
+  sh() { printf '%s\n' "$INSTALL_K3S_EXEC"; }
+  _run_fn k3s-agent-install::apply
+)"
+want="agent --node-ip=100.64.0.9 --flannel-iface=tailscale0 --node-label=browser.lol/burst=true --node-label=example.com/tier=a"
+if [[ "$exec_args" == "$want" ]]; then
+  ok "k3s agent install gets one --node-label per WORKER_NODE_LABELS entry"
+else
+  fail "k3s agent INSTALL_K3S_EXEC: got '$exec_args', want '$want'"
+fi
 rm -rf "$SB"
 
 echo "== 3d. invalid inputs are rejected =="
@@ -137,6 +162,18 @@ if NODE_SETUP_STATE_DIR="$SB/state" NODE_SETUP_CONF_DIR="$SB/conf" \
   ok "--only step of the plan accepted"
 else
   fail "an --only step of the plan should be accepted"
+fi
+rm -rf "$SB"; SB="$(mktemp -d)"
+cp -a "$INFRA/setup" "$SB/setup"
+cp "$SB/setup/cluster.env.example" "$SB/setup/cluster.env"
+echo 'WORKER_NODE_LABELS=("bad label")' >> "$SB/setup/cluster.env"
+if out="$(NODE_SETUP_STATE_DIR="$SB/state" NODE_SETUP_CONF_DIR="$SB/conf" NO_COLOR=1 \
+          "$SB/setup/node-setup" --role worker --dry-run --yes 2>&1)"; then
+  fail "a malformed WORKER_NODE_LABELS entry should be rejected"
+elif grep -q "node label 'bad label' is not a Kubernetes key=value label" <<< "$out"; then
+  ok "malformed WORKER_NODE_LABELS entry rejected"
+else
+  fail "malformed WORKER_NODE_LABELS entry failed for another reason"; echo "$out" | tail -3
 fi
 rm -rf "$SB"
 

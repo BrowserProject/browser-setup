@@ -39,7 +39,7 @@ provision.sh            one-command SSH provisioner (bundles setup/ + runs node-
 fleet.sh                run a command / node-setup doctor across every cluster node
 setup/
   node-setup            the on-node CLI: check -> apply -> verify, journaled + resumable
-  cluster.env           cluster-wide configuration (control-plane IP, DNS, exit-node, DB, UFW)
+  cluster.env           cluster-wide configuration (control-plane IP, DNS, exit-node, DB, UFW, worker labels)
   versions.env          pinned versions (k3s exactly; docker/tailscale apt-held after install)
   lib/framework.sh      the step framework (idempotency, journal, reboot-resume, secrets)
   roles/                role step lists: worker.sh, gateway.sh, control-plane.sh, db.sh
@@ -97,8 +97,9 @@ in `setup/modules/` and reused across roles. See [docs/ROLES.md](docs/ROLES.md).
 Cluster-wide settings sourced by `node-setup` before roles/modules run: the
 default control-plane Tailscale IP (`--server` overrides it per run), the k3s
 datastore + secrets-encryption flags, CoreDNS DaemonSet, worker exit-node
-routing, the DB major version + database list, and UFW trusted sources / public
-ports per role.
+routing, the DB major version + database list, UFW trusted sources / public
+ports per role, and extra k3s node labels for workers (`WORKER_NODE_LABELS`,
+applied only when a worker first registers).
 
 This repo ships **`setup/cluster.env.example`** (a template with placeholder IPs
 and generic defaults), not a real `cluster.env` - per-deployment specifics stay
