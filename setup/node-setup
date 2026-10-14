@@ -241,6 +241,7 @@ cmd_apply() {
   log "plan: ${ROLE_STEPS[*]}"
   if [[ "$ROLE" == "worker" || "$ROLE" == "gateway" ]]; then
     log "control plane: $K3S_SERVER_IP"
+    log "node labels: ${K3S_NODE_LABELS[*]:-none}"
   fi
   if [[ "$DRY_RUN" == "1" ]]; then
     warn "dry-run: no changes will be made"

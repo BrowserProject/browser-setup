@@ -70,19 +70,47 @@ else
   fail "persisted --server lost on re-run"; echo "$out" | tail -3
 fi
 rm -rf "$SB"
-# default from cluster.env when no override
+# default from cluster.env (or the template node-setup falls back to) when no override
 SB="$(mktemp -d)"
-DEFAULT_IP="$(sed -n 's/^K3S_SERVER_IP="\([0-9.]*\)"/\1/p' "$INFRA/setup/cluster.env")"
+CLUSTER_ENV="$INFRA/setup/cluster.env"
+[[ -f "$CLUSTER_ENV" ]] || CLUSTER_ENV="$INFRA/setup/cluster.env.example"
+DEFAULT_IP="$(sed -n 's/^K3S_SERVER_IP="\(.*\)"$/\1/p' "$CLUSTER_ENV")"
 out="$(NODE_SETUP_STATE_DIR="$SB/state" NODE_SETUP_CONF_DIR="$SB/conf" NO_COLOR=1 \
       "$INFRA/setup/node-setup" --role worker --dry-run --yes 2>&1)"
-if grep -q "control plane: $DEFAULT_IP" <<< "$out"; then
+if [[ -n "$DEFAULT_IP" ]] && grep -qxF "[setup] control plane: $DEFAULT_IP" <<< "$out"; then
   ok "default control plane IP comes from cluster.env ($DEFAULT_IP)"
 else
   fail "default control plane IP"; echo "$out" | tail -3
 fi
+if grep -qxF "[setup] node labels: none" <<< "$out"; then
+  ok "a worker without WORKER_NODE_LABELS gets no node labels"
+else
+  fail "default worker node labels"; echo "$out" | tail -3
+fi
 rm -rf "$SB"
 
-echo "== 3c. invalid inputs are rejected =="
+echo "== 3c. WORKER_NODE_LABELS from cluster.env =="
+SB="$(mktemp -d)"
+cp -a "$INFRA/setup" "$SB/setup"
+cp "$SB/setup/cluster.env.example" "$SB/setup/cluster.env"
+echo 'WORKER_NODE_LABELS=("browser.lol/burst=true" "example.com/tier=a")' >> "$SB/setup/cluster.env"
+for role in worker gateway; do
+  out="$(NODE_SETUP_STATE_DIR="$SB/state-$role" NODE_SETUP_CONF_DIR="$SB/conf-$role" NO_COLOR=1 \
+        "$SB/setup/node-setup" --role "$role" --dry-run --yes 2>&1)"
+  labels="$(sed -n 's/^\[setup\] node labels: //p' <<< "$out")"
+  case "$role" in
+    worker)  want="browser.lol/burst=true example.com/tier=a" ;;
+    gateway) want="type=gateway" ;;
+  esac
+  if [[ "$labels" == "$want" ]]; then
+    ok "$role node labels: $labels"
+  else
+    fail "$role node labels: got '$labels', want '$want'"; echo "$out" | tail -3
+  fi
+done
+rm -rf "$SB"
+
+echo "== 3d. invalid inputs are rejected =="
 SB="$(mktemp -d)"
 if NODE_SETUP_STATE_DIR="$SB/state" NODE_SETUP_CONF_DIR="$SB/conf" \
    "$INFRA/setup/node-setup" --role dev --dry-run --yes >/dev/null 2>&1; then
