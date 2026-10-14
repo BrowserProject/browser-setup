@@ -10,6 +10,7 @@ trap 'rm -rf "$SANDBOX"' EXIT
 
 export NODE_SETUP_STATE_DIR="$SANDBOX/state"
 export NODE_SETUP_CONF_DIR="$SANDBOX/conf"
+export NODE_SETUP_RUN_DIR="$SANDBOX/run"
 export NO_COLOR=1
 mkdir -p "$NODE_SETUP_STATE_DIR" "$NODE_SETUP_CONF_DIR"
 
@@ -101,9 +102,13 @@ echo "== step processes see every variable =="
 _UNDERSCORE_UNITS=(a b)
 UIDS_LIKE="kept"
 STEP_DESC[vars]="reads globals"
-vars::apply() { printf '%s %s\n' "${_UNDERSCORE_UNITS[*]}" "$UIDS_LIKE" > "$SANDBOX/vars-seen"; }
+vars::apply() { printf '%s %s %s\n' "${_UNDERSCORE_UNITS[*]}" "$UIDS_LIKE" "$0" > "$SANDBOX/vars-seen"; }
 t "step with globals runs"         run_steps vars
-t "_-prefixed and special-prefixed names reach the step" test "$(cat "$SANDBOX/vars-seen")" = "a b kept"
+read -r seen_a seen_b seen_kept seen_script < "$SANDBOX/vars-seen"
+t "_-prefixed and special-prefixed names reach the step" test "$seen_a $seen_b $seen_kept" = "a b kept"
+# The step script carries every secret: tmpfs only, never the state dir.
+t "the step ran from a script in RUN_DIR" test "${seen_script%/*}" = "$NODE_SETUP_RUN_DIR"
+t "no step script is left behind"  test -z "$(find "$NODE_SETUP_RUN_DIR" "$NODE_SETUP_STATE_DIR" -name '*step.*')"
 
 echo "== failing verify aborts =="
 STEP_DESC[bad]="failing step"
@@ -206,38 +211,22 @@ tf "doctor fails on drift"         doctor_steps s1
 
 echo "== seal =="
 # shellcheck disable=SC1091
+source "$HERE/../setup/modules/k3s-agent.sh"
+# shellcheck disable=SC1091
 source "$HERE/../setup/lib/seal.sh"
+# shellcheck disable=SC1091
+source "$HERE/seal-stubs.sh"
 ROOT="$SANDBOX/root"
-STUB="$SANDBOX/stub"
+STUB="$ROOT/stub"
 SEAL_ROOT="$ROOT"
 BUNDLE_DIR="$ROOT/opt/node-setup"
 CLUSTER_ENV_FILE="$SANDBOX/seal-cluster.env"
 echo 'K3S_SERVER_IP="100.64.0.1"' > "$CLUSTER_ENV_FILE"
 ROLE="worker"
-mkdir -p "$STUB/bin" "$BUNDLE_DIR/docs" "$ROOT/root" "$ROOT/etc/systemd/system"
+mkdir -p "$BUNDLE_DIR/docs" "$ROOT/root" "$ROOT/etc/systemd/system"
 # The bundle's own docs name the secret keys; the scan must leave them alone.
 echo 'TS_AUTHKEY=<ephemeral key>' > "$BUNDLE_DIR/docs/example.md"
-stub() { printf '#!/bin/bash\n%s\n' "$2" > "$STUB/bin/$1"; chmod +x "$STUB/bin/$1"; }
-stub tailscale "echo \"{\\\"BackendState\\\": \\\"\$(cat '$STUB/ts-state' 2>/dev/null || echo NeedsLogin)\\\"}\""
-stub jq "sed -n 's/.*\"BackendState\": *\"\\([^\"]*\\)\".*/\\1/p'"
-stub systemctl "case \"\$1\" in
-  is-active)  [ -f '$STUB/k3s-active' ] ;;
-  is-enabled) if [ -f '$STUB/k3s-enabled' ]; then echo enabled; else echo disabled; exit 1; fi ;;
-  *)          echo \"systemctl \$*\" >> '$STUB/calls' ;;
-esac"
-stub docker "case \"\$1\" in
-  ps)    [ ! -f '$STUB/docker-down' ] || exit 1; cat '$STUB/containers' 2>/dev/null || true ;;
-  image) printf 'srv.example/browser:beta\n<none>:<none>\n' ;;
-esac"
-stub ufw "case \"\$1\" in
-  status) printf '%s\n' '[ 1] Anywhere on tailscale0     ALLOW IN    Anywhere                   # tailnet' \
-    '[ 2] 22/tcp                     ALLOW IN    203.0.113.7                # node-setup: provisioning ssh guard' \
-    '[ 3] 80/tcp                     ALLOW IN    Anywhere' ;;
-  *)      echo \"ufw \$*\" >> '$STUB/calls' ;;
-esac"
-for cmd in apt-get journalctl cloud-init fstrim; do stub "$cmd" "echo \"$cmd \$*\" >> '$STUB/calls'"; done
-stub dpkg-query "echo 1.2.3"
-stub k3s "echo 'k3s version v1.35.4+k3s1 (abc)'"
+seal_stubs "$STUB"
 PATH="$STUB/bin:$PATH"
 
 STEP_DESC[sealed-any]="prepared"; sealed-any::apply() { :; }
@@ -256,9 +245,9 @@ refused() { # refused "name" "expected reason fragment" setup-cmd undo-cmd
 }
 refused "tailscale running"   "tailscale is logged in (BackendState Running)" "echo Running > '$STUB/ts-state'"  "rm '$STUB/ts-state'"
 refused "tailscale starting"  "tailscale is logged in (BackendState Starting)" "echo Starting > '$STUB/ts-state'" "rm '$STUB/ts-state'"
-refused "k3s-agent active"    "k3s-agent is active"   "touch '$STUB/k3s-active'"  "rm '$STUB/k3s-active'"
+refused "k3s-agent active"    "k3s-agent has joined a cluster" "touch '$STUB/k3s-active'" "rm '$STUB/k3s-active'"
 refused "k3s-agent enabled"   "k3s-agent is enabled"  "touch '$STUB/k3s-enabled'" "rm '$STUB/k3s-enabled'"
-refused "registered agent"    "/etc/rancher/node/password exists" \
+refused "registered agent"    "k3s-agent has joined a cluster (it runs, or $ROOT/etc/rancher/node/password exists)" \
   "mkdir -p '$ROOT/etc/rancher/node'; touch '$ROOT/etc/rancher/node/password'" "rm -r '$ROOT/etc/rancher'"
 refused "join token in the agent env" "k3s-agent.service.env holds K3S_TOKEN" \
   "echo K3S_TOKEN=x > '$ROOT/etc/systemd/system/k3s-agent.service.env'" "rm '$ROOT/etc/systemd/system/k3s-agent.service.env'"
@@ -276,8 +265,13 @@ refused "secret in /etc/node-setup" "$NODE_SETUP_CONF_DIR/bake.env assigns a sec
 refused "secret under /root"  "/root/notes assigns a secret" \
   "echo 'export TS_AUTHKEY=tskey' > '$ROOT/root/notes'" "rm '$ROOT/root/notes'"
 refused "secret under /opt"   "/opt/join.env assigns a secret" "echo 'K3S_TOKEN=K10x' > '$ROOT/opt/join.env'" "rm '$ROOT/opt/join.env'"
+refused "unfinished packages" "dpkg --audit lists packages that are not fully installed" \
+  "touch '$STUB/dpkg-unfinished'" "rm '$STUB/dpkg-unfinished'"
 refused "unprepared step"     "not prepared with this bundle and cluster.env: sealed-any" \
   "echo 'K3S_SERVER_IP=\"100.64.0.2\"' > '$CLUSTER_ENV_FILE'" "echo 'K3S_SERVER_IP=\"100.64.0.1\"' > '$CLUSTER_ENV_FILE'"
+refused "unprepared step, whatever --only says" "not prepared with this bundle and cluster.env: sealed-any" \
+  "ONLY_STEPS=sealed-boot; echo 'K3S_SERVER_IP=\"100.64.0.2\"' > '$CLUSTER_ENV_FILE'" \
+  "ONLY_STEPS=''; echo 'K3S_SERVER_IP=\"100.64.0.1\"' > '$CLUSTER_ENV_FILE'"
 t "the refusals left nothing behind"   test -z "$(refusals)"
 
 mkdir -p "$ROOT/var/lib/tailscale" "$ROOT/var/lib/docker" "$ROOT/etc/ssh" "$ROOT/root/.ssh" "$ROOT/home/ubuntu/.ssh" \
@@ -285,9 +279,25 @@ mkdir -p "$ROOT/var/lib/tailscale" "$ROOT/var/lib/docker" "$ROOT/etc/ssh" "$ROOT
 touch "$ROOT/var/lib/tailscale/tailscaled.state" "$ROOT/var/lib/docker/engine-id" "$ROOT/var/lib/k3s-flannel-watchdog.state" \
   "$ROOT/etc/ssh/ssh_host_ed25519_key" "$ROOT/root/.ssh/authorized_keys" "$ROOT/home/ubuntu/.ssh/authorized_keys" \
   "$ROOT/root/.bash_history" "$ROOT/var/lib/apt/lists/archive_Packages" "$ROOT/var/log/apt/history.log.1.gz" \
-  "$ROOT/var/log/syslog" "$ROOT/var/lib/systemd/random-seed" "$NODE_SETUP_STATE_DIR/.apt-stamp" "$NODE_SETUP_STATE_DIR/.step.abc123"
+  "$ROOT/var/log/syslog" "$ROOT/var/lib/systemd/random-seed" "$NODE_SETUP_STATE_DIR/.apt-stamp"
 echo "old log" > "$LOG_FILE"
-t "seal_image runs"                       seal_image
+sealed() { ( seal_image ); }
+SEAL_APT_WAIT_S=0
+touch "$STUB/apt-busy"
+tf "seal_image stops while apt runs"      sealed
+rm "$STUB/apt-busy"; touch "$STUB/dpkg-unfinished"
+tf "seal_image stops on unfinished packages" sealed
+rm "$STUB/dpkg-unfinished"
+t  "both left the disk as it was"         test -e "$ROOT/etc/ssh/ssh_host_ed25519_key" -a ! -e "$NODE_SETUP_CONF_DIR/image.env"
+t  "apt timers and unattended-upgrades stopped first" \
+  test "$(head -n5 "$STUB/calls" | paste -sd' ')" = "systemctl stop apt-daily.timer systemctl stop apt-daily-upgrade.timer systemctl stop apt-daily.service systemctl stop apt-daily-upgrade.service systemctl stop unattended-upgrades.service"
+rm "$STUB/calls"
+# Commands outside the sandbox root stand for the host's own (still stubs here).
+seal_stubs "$SANDBOX/outside"
+out="$( (PATH="$SANDBOX/outside/bin:$PATH"; seal_image) 2>&1 )"
+t  "a sandboxed seal_image refuses commands outside it" grep -q "systemctl is no stub under it" <<< "$out"
+t  "and left the disk as it was"          test -e "$ROOT/etc/ssh/ssh_host_ed25519_key" -a ! -e "$SANDBOX/outside/calls"
+t "seal_image runs"                       sealed
 tf "tailscale node key removed"           test -e "$ROOT/var/lib/tailscale/tailscaled.state"
 tf "docker engine id removed"             test -e "$ROOT/var/lib/docker/engine-id"
 tf "watchdog state removed"               test -e "$ROOT/var/lib/k3s-flannel-watchdog.state"
@@ -300,7 +310,6 @@ tf "rotated logs removed"                 test -e "$ROOT/var/log/apt/history.log
 t  "live logs kept"                       test -e "$ROOT/var/log/syslog"
 tf "random seed removed"                  test -e "$ROOT/var/lib/systemd/random-seed"
 tf "apt stamp removed"                    test -e "$NODE_SETUP_STATE_DIR/.apt-stamp"
-tf "leftover step scripts removed"        test -e "$NODE_SETUP_STATE_DIR/.step.abc123"
 tf "reboot markers removed"               test -e "$NODE_SETUP_STATE_DIR/rebooted-for"
 t  "journal hashes kept"                  test -f "$NODE_SETUP_STATE_DIR/state/sealed-any.hash"
 tf "setup.log truncated"                  grep -q "old log" "$LOG_FILE"

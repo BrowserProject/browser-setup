@@ -173,6 +173,7 @@ this repo is burst-specific. See
 ```bash
 tests/test-framework.sh   # step framework: idempotency, journal, phases, seal refusals
 tests/test-roles.sh       # role wiring, CLI, step behaviour with stubs, shellcheck
+tests/seal-stubs.sh       # stubbed host commands both run seal against
 ```
 
 ## License

@@ -69,8 +69,10 @@ EXTRA_MODULES=""
 SERVER_IP=""
 RESUME=0
 POWEROFF=0
+FLAGS=()
 
 while [[ $# -gt 0 ]]; do
+  [[ "$1" == -* ]] && FLAGS+=("$1")
   case "$1" in
     doctor|status|steps|seal) CMD="$1" ;;
     --role)     ROLE="${2:?--role needs a value}"; shift ;;
@@ -94,6 +96,16 @@ if [[ "$RUN_PHASE" == "prepare" && "$CMD" != "apply" && "$CMD" != "steps" ]]; th
 fi
 if [[ "$POWEROFF" == "1" && "$CMD" != "seal" ]]; then
   die "--poweroff applies to 'seal' only"
+fi
+# seal acts on what the prepare run left (node.conf, journal) and cannot be
+# previewed or narrowed: a seal --dry-run would still seal.
+if [[ "$CMD" == "seal" ]]; then
+  for flag in "${FLAGS[@]}"; do
+    case "$flag" in
+      --poweroff|--yes|-y) ;;
+      *) die "seal takes only --poweroff, not $flag" ;;
+    esac
+  done
 fi
 
 [[ -t 0 && "$ASSUME_YES" != "1" ]] && INTERACTIVE=1
@@ -197,7 +209,7 @@ load_environment() {
   # shellcheck disable=SC1090
   source "$SETUP_DIR/roles/$ROLE.sh"
   if [[ "$RUN_PHASE" == "prepare" && "${ROLE_PREPARABLE:-0}" != "1" ]]; then
-    die "role $ROLE cannot be prepared as a disk image (--prepare is for: worker)"
+    die "role $ROLE cannot be prepared as a disk image (no ROLE_PREPARABLE in roles/$ROLE.sh)"
   fi
 
   # A malformed label would only surface after the k3s install, as an agent
@@ -347,7 +359,7 @@ cmd_steps() {
 cmd_seal() {
   require_root
   load_node_conf
-  [[ -n "$ROLE" ]] || die "nothing to seal: no $CONF_DIR/node.conf (run node-setup --role worker --prepare first)"
+  [[ -n "$ROLE" ]] || die "nothing to seal: no $CONF_DIR/node.conf (run node-setup --role <role> --prepare first)"
   RUN_PHASE=prepare
   load_cluster_env
   load_environment

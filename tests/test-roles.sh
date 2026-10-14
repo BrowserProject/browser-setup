@@ -9,6 +9,10 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 INFRA="$(dirname "$HERE")"
+# Step scripts of every sandboxed run go here instead of this host's /run.
+NODE_SETUP_RUN_DIR="$(mktemp -d)"
+export NODE_SETUP_RUN_DIR
+trap 'rm -rf "$NODE_SETUP_RUN_DIR"' EXIT
 PASS=0 FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok  $*"; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL $*"; }
@@ -220,6 +224,12 @@ SB="$(mktemp -d)"
 ns() { # ns args... -> sandboxed node-setup, output on stdout
   NODE_SETUP_STATE_DIR="$SB/state" NODE_SETUP_CONF_DIR="$SB/conf" NO_COLOR=1 "$INFRA/setup/node-setup" "$@" 2>&1
 }
+# shellcheck disable=SC1091
+source "$HERE/seal-stubs.sh"
+ns_seal() { # ns_seal args... -> node-setup seal on a sandbox root with stubbed host commands
+  seal_stubs "$SB/root/stub"
+  NODE_SETUP_SEAL_ROOT="$SB/root" PATH="$SB/root/stub/bin:$PATH" ns seal "$@"
+}
 steps_prepare="$(ns steps --role worker --prepare)"
 steps_apply="$(ns steps --role worker)"
 if grep -q '^k3s-agent-preinstall ' <<< "$steps_prepare" \
@@ -271,23 +281,33 @@ refused "--only k3s-agent-preinstall without --prepare" --role worker --only k3s
 if ns doctor --prepare >/dev/null; then fail "doctor --prepare should be refused"; else ok "doctor --prepare refused"; fi
 if ns status --poweroff >/dev/null; then fail "--poweroff outside seal should be refused"; else ok "--poweroff outside seal refused"; fi
 rm -rf "$SB"; SB="$(mktemp -d)"
-if out="$(ns seal)"; then fail "seal without a prepared node should be refused"
+if out="$(ns_seal)"; then fail "seal without a prepared node should be refused"
 elif grep -q "nothing to seal" <<< "$out"; then ok "seal refuses a node without node.conf"
 else fail "seal without node.conf failed for another reason"; echo "$out" | tail -3; fi
 # The secret scan must stay inside the sandbox, not this host's /root and /opt.
 mkdir -p "$SB/root/root" "$SB/root/opt"
 ns --role worker --dry-run --yes >/dev/null
 rm -rf "$SB/state"
-if out="$(NODE_SETUP_SEAL_ROOT="$SB/root" ns seal)"; then fail "seal of an unprepared worker should be refused"
+if out="$(ns_seal)"; then fail "seal of an unprepared worker should be refused"
 elif grep -q "seal refused: not prepared with this bundle and cluster.env: base-packages" <<< "$out" \
      && grep -q "nothing was changed" <<< "$out" && [[ ! -e "$SB/conf/image.env" ]]; then
   ok "seal refuses an unprepared worker and changes nothing"
 else fail "seal of an unprepared worker failed for another reason"; echo "$out" | tail -3; fi
 rm -rf "$SB"; SB="$(mktemp -d)"
 ns --role gateway --dry-run --yes >/dev/null
-if out="$(ns seal)"; then fail "seal of a gateway should be refused"
+if out="$(ns_seal)"; then fail "seal of a gateway should be refused"
 elif grep -q "cannot be prepared as a disk image" <<< "$out"; then ok "seal refuses a role that cannot be prepared"
 else fail "seal of a gateway failed for another reason"; echo "$out" | tail -3; fi
+rm -rf "$SB"; SB="$(mktemp -d)"
+# seal cannot be previewed or narrowed: every run flag but --poweroff is refused.
+ns --role worker --dry-run --yes >/dev/null
+for flags in --dry-run --resume "--only base-time" "--skip base-packages" "--role worker" "--server 100.64.0.1" "--modules deadssd"; do
+  # shellcheck disable=SC2086
+  if out="$(ns_seal $flags)"; then fail "seal $flags should be refused"
+  elif grep -q "seal takes only --poweroff, not ${flags%% *}" <<< "$out" && [[ ! -e "$SB/root/stub/calls" ]]; then
+    ok "seal $flags refused before anything ran"
+  else fail "seal $flags failed for another reason"; echo "$out" | tail -3; fi
+done
 rm -rf "$SB"
 
 # k3s split: the bake pre-installs without any join value, the boot join reuses

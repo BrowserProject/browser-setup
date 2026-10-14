@@ -9,16 +9,24 @@ _k3s_installed_version() {
   k3s --version 2>/dev/null | head -n1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+' || true
 }
 
+# The cached installer and the pinned binary are both in place.
+_k3s_preinstalled() {
+  [[ -s "$K3S_INSTALLER_CACHE" && "$(_k3s_installed_version)" == "$K3S_VERSION" ]]
+}
+
+_k3s_agent_joined() { # root ("" for this host) -> 0 when the agent runs or has registered
+  systemctl is-active --quiet k3s-agent 2>/dev/null || [[ -e "$1/etc/rancher/node/password" ]]
+}
+
 STEP_DESC["k3s-agent-preinstall"]="image bake: pinned k3s binary and a disabled agent unit (k3s-agent-install joins at boot)"
 STEP_PHASE["k3s-agent-preinstall"]=bake
 k3s-agent-preinstall::check() {
-  [[ -s "$K3S_INSTALLER_CACHE" && "$(_k3s_installed_version)" == "$K3S_VERSION" ]] \
-    && systemctl cat k3s-agent.service >/dev/null 2>&1
+  _k3s_preinstalled && systemctl cat k3s-agent.service >/dev/null 2>&1
 }
 k3s-agent-preinstall::apply() {
   # The installer disables the unit and rewrites its env file: on a joined
   # node that would drop the join on the next restart.
-  if systemctl is-active --quiet k3s-agent || [[ -e /etc/rancher/node/password ]]; then
+  if _k3s_agent_joined ""; then
     die "k3s-agent has joined a cluster on this host; the pre-install is for a fresh image bake only"
   fi
   mkdir -p "$(dirname "$K3S_INSTALLER_CACHE")"
@@ -63,7 +71,7 @@ k3s-agent-install::apply() {
 
   local -x INSTALL_K3S_VERSION="$K3S_VERSION" K3S_TOKEN="$K3S_TOKEN" K3S_URL="$K3S_URL" \
     INSTALL_K3S_EXEC="${exec_args[*]}"
-  if [[ -s "$K3S_INSTALLER_CACHE" && "$(_k3s_installed_version)" == "$K3S_VERSION" ]]; then
+  if _k3s_preinstalled; then
     INSTALL_K3S_SKIP_DOWNLOAD=true sh "$K3S_INSTALLER_CACHE"
   else
     curl -sfL https://get.k3s.io | sh -

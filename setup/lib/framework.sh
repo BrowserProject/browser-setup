@@ -243,10 +243,12 @@ _has_fn() { declare -F "$1" >/dev/null 2>&1; }
 # a conditional context (if/!/&&/||), and the runner has to call steps
 # conditionally. A new process has its own errexit context, so a failing
 # command inside apply() truly aborts the step. Shell state (vars, arrays,
-# functions) is serialized in; results travel back via files, never variables.
+# functions, secrets) is serialized in, on tmpfs so that no disk and no disk
+# image ever holds it; results travel back via files, never variables.
 _run_fn() {
   local fn="$1" script rc=0
-  script="$(mktemp "$STATE_DIR/.step.XXXXXX")"
+  install -d -m 0700 "$RUN_DIR"
+  script="$(mktemp "$RUN_DIR/step.XXXXXX")"
   {
     # exclude bash-special / readonly names; everything else (cluster env,
     # role arrays, secrets, framework globals) is re-declared in the child
@@ -283,7 +285,6 @@ _step_selected() { [[ -z "$(_step_skip_reason "$1")" ]]; }
 run_steps() {
   local step hash state_file reason
   mkdir -p "$STATE_DIR/state" "$STATE_DIR/rebooted-for"
-  chmod 700 "$STATE_DIR"   # step scripts serialize secrets through here
 
   for step in "$@"; do
     reason="$(_step_skip_reason "$step")"

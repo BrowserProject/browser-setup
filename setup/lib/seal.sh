@@ -6,11 +6,22 @@
 # state) and keeps the step journal, which lets a clone skip the prepared steps.
 #
 # Every absolute path is under SEAL_ROOT, so the tests can run it in a sandbox.
+# It needs the modules sourced (k3s-agent.sh).
 
 SEAL_ROOT="${NODE_SETUP_SEAL_ROOT:-}"
 # The keys an image must never carry; the bundle's own docs and scripts name
 # them, so the scan leaves the bundle out.
 SEAL_SECRET_KEYS="REGISTRY_PASSWORD|TS_AUTHKEY|K3S_TOKEN"
+# What seal runs that changes the host; a sandboxed seal finds each as a stub
+# under SEAL_ROOT or refuses.
+SEAL_HOST_COMMANDS=(systemctl ufw apt-get journalctl cloud-init fstrim)
+# Package activity a fresh cloud VM starts on its own; it must neither hold the
+# apt locks during the cleanup nor be cut off by the poweroff.
+SEAL_APT_UNITS=(apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service)
+SEAL_APT_WAIT_S=600
+
+_apt_idle() { ! pgrep -x 'apt|apt-get|dpkg|unattended-upgr' >/dev/null; }
+_dpkg_unfinished() { [[ -n "$(dpkg --audit 2>/dev/null)" ]]; }
 
 # seal_refusals step... -> one reason per line, nothing when the disk may be
 # sealed. The steps are the role's plan; each one the prepare phase runs must
@@ -22,9 +33,8 @@ seal_refusals() {
   if [[ "$state" == "Running" || "$state" == "Starting" ]]; then
     echo "tailscale is logged in (BackendState $state); the image would share its node key"
   fi
-  systemctl is-active --quiet k3s-agent 2>/dev/null && echo "k3s-agent is active"
+  _k3s_agent_joined "$r" && echo "k3s-agent has joined a cluster (it runs, or $r/etc/rancher/node/password exists)"
   [[ "$(systemctl is-enabled k3s-agent 2>/dev/null || true)" == enabled* ]] && echo "k3s-agent is enabled"
-  [[ -e "$r/etc/rancher/node/password" ]] && echo "$r/etc/rancher/node/password exists (the agent has registered)"
   grep -qs '^K3S_TOKEN=' "$r/etc/systemd/system/k3s-agent.service.env" \
     && echo "$r/etc/systemd/system/k3s-agent.service.env holds K3S_TOKEN"
   if ! containers="$(docker ps -aq 2>/dev/null)"; then
@@ -38,6 +48,7 @@ seal_refusals() {
     [[ -e "$f" ]] && echo "$f exists (a provisioning script with secrets)"
   done
   [[ -e "$r/etc/systemd/system/node-setup-resume.service" ]] && echo "a node-setup run is unfinished (node-setup-resume.service)"
+  _dpkg_unfinished && echo "dpkg --audit lists packages that are not fully installed"
 
   for f in "$CONF_DIR" "$r/root" "$r/opt"; do
     [[ -d "$f" ]] && dirs+=("$f")
@@ -50,7 +61,7 @@ seal_refusals() {
   fi
 
   for step in "$@"; do
-    [[ -z "$(_step_skip_reason "$step")" ]] || continue
+    [[ -z "$(_phase_skip_reason "$step")" ]] || continue
     [[ "$(cat "$STATE_DIR/state/$step.hash" 2>/dev/null)" == "$(_step_hash "$step")" ]] || missing+=("$step")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
@@ -60,7 +71,21 @@ seal_refusals() {
 }
 
 seal_image() {
-  local r="$SEAL_ROOT" n images
+  local r="$SEAL_ROOT" n images path
+
+  if [[ -n "$r" ]]; then
+    for n in "${SEAL_HOST_COMMANDS[@]}"; do
+      path="$(command -v "$n" || true)"
+      [[ "$path" == "$r"/* ]] || die "NODE_SETUP_SEAL_ROOT is set, but $n is no stub under it (${path:-missing}); refusing to seal this host"
+    done
+  fi
+
+  for n in "${SEAL_APT_UNITS[@]}"; do
+    systemctl stop "$n" >/dev/null 2>&1 || true
+  done
+  wait_for "$SEAL_APT_WAIT_S" 5 _apt_idle \
+    || die "apt or dpkg still runs after ${SEAL_APT_WAIT_S}s; nothing was removed, run seal again"
+  ! _dpkg_unfinished || die "dpkg --audit lists packages that are not fully installed; nothing was removed"
 
   images="$(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>' | sort | paste -sd' ' || true)"
   mkdir -p "$CONF_DIR"
@@ -86,7 +111,7 @@ seal_image() {
   rm -f "$r/var/lib/docker/engine-id" "$r"/var/lib/k3s-flannel-watchdog*.state
 
   # transient journal state; state/*.hash stays and is the point of the image
-  rm -rf "$STATE_DIR"/.step.* "$STATE_DIR/.apt-stamp" "$REBOOT_FLAG_FILE" "$STATE_DIR/rebooted-for"
+  rm -rf "$STATE_DIR/.apt-stamp" "$REBOOT_FLAG_FILE" "$STATE_DIR/rebooted-for"
   : > "$LOG_FILE"
 
   # the lockout guard ufw-rules pins for the SSH client of the bake, by its comment
