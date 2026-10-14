@@ -1,13 +1,21 @@
 # base.sh - baseline OS state shared by every role.
 # shellcheck shell=bash
 
+BASE_PACKAGES=(curl jq ca-certificates gnupg lsb-release htop ufw)
+
 STEP_DESC["base-packages"]="install baseline packages + full upgrade on first run"
+# Any journal entry means the first run is done: a node or disk image that
+# upgraded once adopts this step after a pin or cluster.env change instead of
+# running the full upgrade again.
+base-packages::check() {
+  [[ -f "$STATE_DIR/state/base-packages.hash" ]] && dpkg -s "${BASE_PACKAGES[@]}" >/dev/null 2>&1
+}
 base-packages::apply() {
   apt_update_once
   # Full upgrade once at provision time; afterwards unattended-upgrades applies
   # security updates only (see base-unattended).
   DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
-  ensure_pkgs curl jq ca-certificates gnupg lsb-release htop ufw
+  ensure_pkgs "${BASE_PACKAGES[@]}"
 }
 base-packages::verify() {
   command -v curl >/dev/null && command -v jq >/dev/null && command -v ufw >/dev/null

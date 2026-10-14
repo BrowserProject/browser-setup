@@ -97,6 +97,14 @@ t "cluster.env change re-applies"  run_steps s1
 t "apply count bumped again"       test "$(cat "$APPLIED")" = "32"
 CLUSTER_ENV_FILE=""
 
+echo "== step processes see every variable =="
+_UNDERSCORE_UNITS=(a b)
+UIDS_LIKE="kept"
+STEP_DESC[vars]="reads globals"
+vars::apply() { printf '%s %s\n' "${_UNDERSCORE_UNITS[*]}" "$UIDS_LIKE" > "$SANDBOX/vars-seen"; }
+t "step with globals runs"         run_steps vars
+t "_-prefixed and special-prefixed names reach the step" test "$(cat "$SANDBOX/vars-seen")" = "a b kept"
+
 echo "== failing verify aborts =="
 STEP_DESC[bad]="failing step"
 bad::apply() { :; }

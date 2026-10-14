@@ -177,6 +177,43 @@ else
 fi
 rm -rf "$SB"
 
+echo "== 3e. adoption checks =="
+SB="$(mktemp -d)"
+# Each check runs in the framework's child process, as in a real run.
+# shellcheck disable=SC1091
+base_check_rc() {
+  (
+    source "$INFRA/setup/lib/framework.sh"
+    source "$INFRA/setup/modules/base.sh"
+    STATE_DIR="$SB/state"
+    dpkg() { [[ ! -f "$SB/no-pkgs" ]]; }
+    _run_fn base-packages::check
+  ) >/dev/null 2>&1
+}
+mkdir -p "$SB/state/state"
+if ! base_check_rc; then ok "base-packages: a fresh node runs the full upgrade"; else fail "base-packages adopted without a journal entry"; fi
+echo stale > "$SB/state/state/base-packages.hash"
+if base_check_rc; then ok "base-packages: a journaled node adopts on a hash change"; else fail "base-packages did not adopt"; fi
+touch "$SB/no-pkgs"
+if ! base_check_rc; then ok "base-packages: a missing package re-applies"; else fail "base-packages ignored a missing package"; fi
+rm -rf "$SB"
+# oom-guards writes under /etc/systemd/system; test its check through a copy
+# whose drop-in path points into the sandbox.
+SB="$(mktemp -d)"
+oom_check_rc() {
+  (
+    source "$INFRA/setup/lib/framework.sh"
+    eval "$(sed "s#/etc/systemd/system#$SB#g" "$INFRA/setup/modules/resilience.sh")"
+    STATE_DIR="$SB"
+    systemctl() { [[ "$1 $2" == "cat k3s-agent.service" ]]; }
+    _run_fn oom-guards::check
+  ) >/dev/null 2>&1
+}
+if ! oom_check_rc; then ok "oom-guards: an existing unit without the drop-in fails the check"; else fail "oom-guards check passed without a drop-in"; fi
+mkdir -p "$SB/k3s-agent.service.d" && touch "$SB/k3s-agent.service.d/90-oom.conf"
+if oom_check_rc; then ok "oom-guards: the drop-in on every existing unit passes the check"; else fail "oom-guards check failed with the drop-in"; fi
+rm -rf "$SB"
+
 echo "== 4. pristine-container dry-run (fresh node simulation) =="
 if docker info >/dev/null 2>&1; then
   IMG="ubuntu:24.04"

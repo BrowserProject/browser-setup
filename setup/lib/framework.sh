@@ -242,7 +242,7 @@ _run_fn() {
   {
     # exclude bash-special / readonly names; everything else (cluster env,
     # role arrays, secrets, framework globals) is re-declared in the child
-    declare -p | grep -Ev '^declare -[[:alnum:]-]+ (BASH[A-Z_]*|BASH_[A-Za-z_]*|EUID|PPID|SHELLOPTS|UID|FUNCNAME|GROUPS|DIRSTACK|PIPESTATUS|RANDOM|SECONDS|LINENO|SRANDOM|EPOCHREALTIME|EPOCHSECONDS|OPTIND|OPTERR|HOSTNAME|HOSTTYPE|MACHTYPE|OSTYPE|IFS|SHELL|SHLVL|_)=?' || true
+    declare -p | grep -Ev '^declare -[[:alnum:]-]+ (BASH[A-Z_]*|BASH_[A-Za-z_]*|EUID|PPID|SHELLOPTS|UID|FUNCNAME|GROUPS|DIRSTACK|PIPESTATUS|RANDOM|SECONDS|LINENO|SRANDOM|EPOCHREALTIME|EPOCHSECONDS|OPTIND|OPTERR|HOSTNAME|HOSTTYPE|MACHTYPE|OSTYPE|IFS|SHELL|SHLVL|_)(=|$)' || true
     declare -f
     printf 'set -eo pipefail\n%s\n' "$fn"
   } > "$script"
