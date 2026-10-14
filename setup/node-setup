@@ -9,14 +9,16 @@
 #   node-setup doctor                           # read-only drift report for this node
 #   node-setup status                           # journal + node identity
 #   node-setup steps [--role X] [--prepare]     # list the step plan
-#   node-setup --role worker --prepare --yes    # bake a disk image (no secrets, no identity)
+#   node-setup --role worker --prepare --yes    # bake a disk image (no join secrets, no identity)
+#   node-setup seal [--poweroff]                # make the prepared disk clonable, then snapshot it
 #
 # Flags: --yes  --dry-run  --server ip  --only step[,step]  --skip step[,step]  --resume  --prepare
 #
 # --prepare runs every step except the boot steps (tailscale join, k3s join)
 # plus the bake steps (k3s pre-install, browser image prefetch) and journals
-# them, so a node booted from the image and run normally with the same bundle
-# and cluster.env applies only the boot steps.
+# them. seal refuses while the disk holds an identity or a secret, then strips
+# what each clone creates itself. A node booted from the image and run normally
+# with the same bundle, cluster.env and --server applies only the boot steps.
 #
 # Roles: worker | gateway | control-plane | db
 # (the registry host and the dev server are NOT managed here; the dev server
@@ -52,6 +54,8 @@ export PAYLOAD_DIR MANIFEST_DIR VERSIONS_FILE CLUSTER_ENV_FILE
 
 # shellcheck source=lib/framework.sh
 source "$SETUP_DIR/lib/framework.sh"
+# shellcheck source=lib/seal.sh
+source "$SETUP_DIR/lib/seal.sh"
 
 ROLES=(worker gateway control-plane db)
 OPTIONAL_MODULES=(deadssd direct-egress)
@@ -64,10 +68,11 @@ ROLE=""
 EXTRA_MODULES=""
 SERVER_IP=""
 RESUME=0
+POWEROFF=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    doctor|status|steps) CMD="$1" ;;
+    doctor|status|steps|seal) CMD="$1" ;;
     --role)     ROLE="${2:?--role needs a value}"; shift ;;
     --modules)  EXTRA_MODULES="${2:?--modules needs a value}"; shift ;;
     --server)   SERVER_IP="${2:?--server needs a value}"; shift ;;
@@ -77,6 +82,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run)  DRY_RUN=1 ;;
     --resume)   RESUME=1; ASSUME_YES=1 ;;
     --prepare)  RUN_PHASE=prepare ;;
+    --poweroff) POWEROFF=1 ;;
     -h|--help)  usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
@@ -85,6 +91,9 @@ done
 
 if [[ "$RUN_PHASE" == "prepare" && "$CMD" != "apply" && "$CMD" != "steps" ]]; then
   die "--prepare applies to a provisioning run or 'steps', not '$CMD'"
+fi
+if [[ "$POWEROFF" == "1" && "$CMD" != "seal" ]]; then
+  die "--poweroff applies to 'seal' only"
 fi
 
 [[ -t 0 && "$ASSUME_YES" != "1" ]] && INTERACTIVE=1
@@ -318,6 +327,9 @@ cmd_status() {
   else
     echo "journal:  empty"
   fi
+  if [[ -f "$CONF_DIR/image.env" ]]; then
+    echo "image:    sealed $(sed -n 's/^IMAGE_SEALED_AT=//p' "$CONF_DIR/image.env") ($CONF_DIR/image.env)"
+  fi
 }
 
 cmd_steps() {
@@ -332,9 +344,31 @@ cmd_steps() {
   done
 }
 
+cmd_seal() {
+  require_root
+  load_node_conf
+  [[ -n "$ROLE" ]] || die "nothing to seal: no $CONF_DIR/node.conf (run node-setup --role worker --prepare first)"
+  RUN_PHASE=prepare
+  load_cluster_env
+  load_environment
+  local reasons line
+  reasons="$(seal_refusals "${ROLE_STEPS[@]}")"
+  if [[ -n "$reasons" ]]; then
+    while IFS= read -r line; do err "seal refused: $line"; done <<< "$reasons"
+    die "this disk cannot become an image yet; nothing was changed"
+  fi
+  seal_image
+  ok "sealed: role=$ROLE; snapshot the disk once the machine is off"
+  if [[ "$POWEROFF" == "1" ]]; then
+    log "powering off"
+    systemctl --no-block poweroff
+  fi
+}
+
 case "$CMD" in
   apply)  cmd_apply ;;
   doctor) cmd_doctor ;;
   status) cmd_status ;;
   steps)  cmd_steps ;;
+  seal)   cmd_seal ;;
 esac

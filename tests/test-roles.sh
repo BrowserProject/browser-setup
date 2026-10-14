@@ -24,7 +24,7 @@ echo "== 2. shellcheck =="
 if command -v shellcheck >/dev/null; then
   # SC1090/SC1091: dynamic sources; SC2034: cluster env vars are consumed by
   # other sourced files; SC2317: step functions are invoked indirectly.
-  SC_FILES=("$INFRA/setup/node-setup" "$INFRA/setup/lib/framework.sh"
+  SC_FILES=("$INFRA/setup/node-setup" "$INFRA/setup/lib/framework.sh" "$INFRA/setup/lib/seal.sh"
             "$INFRA"/setup/modules/*.sh "$INFRA"/setup/roles/*.sh
             "$INFRA/setup/payloads/flannel-watchdog.sh"
             "$INFRA/provision.sh" "$INFRA/fleet.sh")
@@ -269,6 +269,25 @@ refused() { # refused "name" args... -> the run must fail with a phase message
 refused "--prepare --only tailscale-up" --role worker --prepare --only tailscale-up --dry-run --yes
 refused "--only k3s-agent-preinstall without --prepare" --role worker --only k3s-agent-preinstall --dry-run --yes
 if ns doctor --prepare >/dev/null; then fail "doctor --prepare should be refused"; else ok "doctor --prepare refused"; fi
+if ns status --poweroff >/dev/null; then fail "--poweroff outside seal should be refused"; else ok "--poweroff outside seal refused"; fi
+rm -rf "$SB"; SB="$(mktemp -d)"
+if out="$(ns seal)"; then fail "seal without a prepared node should be refused"
+elif grep -q "nothing to seal" <<< "$out"; then ok "seal refuses a node without node.conf"
+else fail "seal without node.conf failed for another reason"; echo "$out" | tail -3; fi
+# The secret scan must stay inside the sandbox, not this host's /root and /opt.
+mkdir -p "$SB/root/root" "$SB/root/opt"
+ns --role worker --dry-run --yes >/dev/null
+rm -rf "$SB/state"
+if out="$(NODE_SETUP_SEAL_ROOT="$SB/root" ns seal)"; then fail "seal of an unprepared worker should be refused"
+elif grep -q "seal refused: not prepared with this bundle and cluster.env: base-packages" <<< "$out" \
+     && grep -q "nothing was changed" <<< "$out" && [[ ! -e "$SB/conf/image.env" ]]; then
+  ok "seal refuses an unprepared worker and changes nothing"
+else fail "seal of an unprepared worker failed for another reason"; echo "$out" | tail -3; fi
+rm -rf "$SB"; SB="$(mktemp -d)"
+ns --role gateway --dry-run --yes >/dev/null
+if out="$(ns seal)"; then fail "seal of a gateway should be refused"
+elif grep -q "cannot be prepared as a disk image" <<< "$out"; then ok "seal refuses a role that cannot be prepared"
+else fail "seal of a gateway failed for another reason"; echo "$out" | tail -3; fi
 rm -rf "$SB"
 
 # k3s split: the bake pre-installs without any join value, the boot join reuses
