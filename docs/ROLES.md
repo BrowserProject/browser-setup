@@ -71,22 +71,29 @@ node-setup --role worker --yes --server <control-plane-ip> [--modules ...]
   join token in its env file, any container, `secrets.env`, a registry login,
   a `/opt/burst-*.sh` script, a file under `/etc/node-setup`, `/root` or `/opt`
   (the bundle aside) assigning `REGISTRY_PASSWORD`, `TS_AUTHKEY` or
-  `K3S_TOKEN`, an unfinished run, or a prepare step missing from the journal.
-  Then it writes `/etc/node-setup/image.env`, wipes the tailscale state, the
+  `K3S_TOKEN`, an unfinished run, a package `dpkg --audit` lists, or a
+  prepare step missing from the journal. Then it stops the apt timers and
+  `unattended-upgrades`, waits until apt and dpkg are idle (still busy after
+  10 minutes: it stops, nothing removed), writes
+  `/etc/node-setup/image.env`, wipes the tailscale state, the
   docker engine id, SSH host keys, authorized keys, shell history, apt lists,
   rotated logs, the journal's transient files (keeping `state/*.hash`) and the
   ufw SSH lockout guard rules, and runs `cloud-init clean --logs --seed
   --machine-id`, so each clone gets its own machine id, keys and tailnet node.
+- `seal` takes no flag but `--poweroff`: it cannot be previewed (`--dry-run`
+  would still seal) or narrowed (`--only`/`--skip`), and acts on the role
+  and journal the prepare run left.
 
 `BAKE_IMAGES` (in `secrets.env`, space separated) names each image by the
-reference the edge uses: the environment's browser catalog, and any helper
-image worth baking in. A reference with a registry host is pulled through
-`REGISTRY_SERVER` with `REGISTRY_USER`/`REGISTRY_PASSWORD`; when its host
-differs (a mirror of the same registry with keys of its own), the pull is
-tagged back to the reference. Docker cannot tag a digest, so a digest
-reference must name `REGISTRY_SERVER` itself or a public registry. References
-without a host are pulled anonymously from Docker Hub. The login lives on
-tmpfs for the pulls only.
+reference the edge uses: the environment's browser catalog and the helper
+images its edge pulls. A reference with a registry host must name
+`REGISTRY_SERVER` or a mirror of it (the same repositories, keys of its own);
+it is pulled through `REGISTRY_SERVER` with `REGISTRY_USER`/`REGISTRY_PASSWORD`
+and, for a mirror, tagged back to the reference. Docker cannot tag a digest,
+so a digest reference works only on `REGISTRY_SERVER` itself; the step
+refuses any other. Public images go in as host-less Docker Hub references
+(`curlimages/curl:8.22.0`), pulled anonymously. The login lives on tmpfs for
+the pulls only, like the scripts every step runs from.
 
 ## gateway
 

@@ -80,7 +80,7 @@ cat > /etc/node-setup/secrets.env <<'ENV'
 REGISTRY_SERVER=<registry host>
 REGISTRY_USER=<pull-only key>
 REGISTRY_PASSWORD=<its secret>
-BAKE_IMAGES="<catalog references, space separated>"
+BAKE_IMAGES="<catalog and helper image references, space separated>"
 ENV
 /opt/node-setup/setup/node-setup --role worker --prepare --yes --server <control-plane-ip>
 rm -f /opt/burst-bake.sh /etc/node-setup/secrets.env
@@ -89,7 +89,9 @@ rm -f /opt/burst-bake.sh /etc/node-setup/secrets.env
 
 - `--prepare` installs and journals every step except the join, pre-installs
   k3s, and pulls `BAKE_IMAGES` (prefetch images). Without `BAKE_IMAGES` the
-  image holds no browser image (slim).
+  image holds no browser image (slim). A digest-pinned image on a registry
+  other than `REGISTRY_SERVER` cannot be baked under its name, so the Backend
+  leaves it out and the edge pulls it on first use.
 - The registry key is only in `secrets.env`, which `node-setup` shreds, and
   in a docker login on tmpfs for the duration of the pulls.
 - `seal` refuses while any secret or identity is left (including the bake
