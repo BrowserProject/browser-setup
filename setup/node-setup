@@ -8,9 +8,17 @@
 #   node-setup --role worker --server 100.x.y.z # join a specific control plane
 #   node-setup doctor                           # read-only drift report for this node
 #   node-setup status                           # journal + node identity
-#   node-setup steps [--role X]                 # list the step plan
+#   node-setup steps [--role X] [--prepare]     # list the step plan
+#   node-setup --role worker --prepare --yes    # bake a disk image (no join secrets, no identity)
+#   node-setup seal [--poweroff]                # make the prepared disk clonable, then snapshot it
 #
-# Flags: --yes  --dry-run  --server ip  --only step[,step]  --skip step[,step]  --resume
+# Flags: --yes  --dry-run  --server ip  --only step[,step]  --skip step[,step]  --resume  --prepare
+#
+# --prepare runs every step except the boot steps (tailscale join, k3s join)
+# plus the bake steps (k3s pre-install, browser image prefetch) and journals
+# them. seal refuses while the disk holds an identity or a secret, then strips
+# what each clone creates itself. A node booted from the image and run normally
+# with the same bundle, cluster.env and --server applies only the boot steps.
 #
 # Roles: worker | gateway | control-plane | db
 # (the registry host and the dev server are NOT managed here; the dev server
@@ -46,11 +54,13 @@ export PAYLOAD_DIR MANIFEST_DIR VERSIONS_FILE CLUSTER_ENV_FILE
 
 # shellcheck source=lib/framework.sh
 source "$SETUP_DIR/lib/framework.sh"
+# shellcheck source=lib/seal.sh
+source "$SETUP_DIR/lib/seal.sh"
 
 ROLES=(worker gateway control-plane db)
 OPTIONAL_MODULES=(deadssd direct-egress alt-tailscale-port)
 
-usage() { sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n "3,/^set /{/^#/s/^# \{0,1\}//p}" "$0"; }
 
 # --- argument parsing ---------------------------------------------------------
 CMD="apply"
@@ -58,10 +68,13 @@ ROLE=""
 EXTRA_MODULES=""
 SERVER_IP=""
 RESUME=0
+POWEROFF=0
+FLAGS=()
 
 while [[ $# -gt 0 ]]; do
+  [[ "$1" == -* ]] && FLAGS+=("$1")
   case "$1" in
-    doctor|status|steps) CMD="$1" ;;
+    doctor|status|steps|seal) CMD="$1" ;;
     --role)     ROLE="${2:?--role needs a value}"; shift ;;
     --modules)  EXTRA_MODULES="${2:?--modules needs a value}"; shift ;;
     --server)   SERVER_IP="${2:?--server needs a value}"; shift ;;
@@ -70,11 +83,30 @@ while [[ $# -gt 0 ]]; do
     --yes|-y)   ASSUME_YES=1 ;;
     --dry-run)  DRY_RUN=1 ;;
     --resume)   RESUME=1; ASSUME_YES=1 ;;
+    --prepare)  RUN_PHASE=prepare ;;
+    --poweroff) POWEROFF=1 ;;
     -h|--help)  usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
   shift
 done
+
+if [[ "$RUN_PHASE" == "prepare" && "$CMD" != "apply" && "$CMD" != "steps" ]]; then
+  die "--prepare applies to a provisioning run or 'steps', not '$CMD'"
+fi
+if [[ "$POWEROFF" == "1" && "$CMD" != "seal" ]]; then
+  die "--poweroff applies to 'seal' only"
+fi
+# seal acts on what the prepare run left (node.conf, journal) and cannot be
+# previewed or narrowed: a seal --dry-run would still seal.
+if [[ "$CMD" == "seal" ]]; then
+  for flag in "${FLAGS[@]}"; do
+    case "$flag" in
+      --poweroff|--yes|-y) ;;
+      *) die "seal takes only --poweroff, not $flag" ;;
+    esac
+  done
+fi
 
 [[ -t 0 && "$ASSUME_YES" != "1" ]] && INTERACTIVE=1
 
@@ -177,6 +209,19 @@ load_environment() {
   done
   # shellcheck disable=SC1090
   source "$SETUP_DIR/roles/$ROLE.sh"
+  if [[ "$RUN_PHASE" == "prepare" && "${ROLE_PREPARABLE:-0}" != "1" ]]; then
+    die "role $ROLE cannot be prepared as a disk image (no ROLE_PREPARABLE in roles/$ROLE.sh)"
+  fi
+
+  # A malformed label would only surface after the k3s install, as an agent
+  # that never registers; the installer also splits INSTALL_K3S_EXEC on spaces.
+  if [[ "$ROLE" == "worker" || "$ROLE" == "gateway" ]]; then
+    local label label_re='^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?=([A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?$'
+    for label in "${K3S_NODE_LABELS[@]}"; do
+      [[ "$label" =~ $label_re ]] \
+        || die "node label '$label' is not a Kubernetes key=value label (WORKER_NODE_LABELS in cluster.env)"
+    done
+  fi
 
   # append opted-in extra modules to the role's step list
   if [[ -n "$EXTRA_MODULES" ]]; then
@@ -203,13 +248,17 @@ load_environment() {
     done
   fi
 
-  # A --only/--skip name outside this plan would skip every step and still
-  # report success.
-  local step names=()
+  # A --only/--skip name outside this plan, or of the other phase, would skip
+  # every step and still report success.
+  local step names=() phase_reason
   IFS=, read -ra names <<< "${ONLY_STEPS},${SKIP_STEPS}"
   for step in "${names[@]}"; do
-    [[ -z "$step" ]] || in_list "$step" "${ROLE_STEPS[@]}" \
+    [[ -z "$step" ]] && continue
+    in_list "$step" "${ROLE_STEPS[@]}" \
       || die "--only/--skip: '$step' is not a step of role $ROLE (see: node-setup steps --role $ROLE)"
+    phase_reason="$(_phase_skip_reason "$step")"
+    [[ -z "$phase_reason" ]] \
+      || die "--only/--skip: '$step' never runs in this run (${phase_reason}; see: node-setup steps --role $ROLE)"
   done
 }
 
@@ -223,6 +272,11 @@ finish_run() {
   # convenience: make `node-setup` available on PATH for doctor/status later
   ln -sf "$NODE_SETUP_BIN" /usr/local/bin/node-setup
   echo
+  if [[ "$RUN_PHASE" == "prepare" ]]; then
+    ok "image prepared: role=$ROLE"
+    ok "next, before the snapshot: node-setup seal [--poweroff]"
+    return 0
+  fi
   ok "provisioning complete: role=$ROLE"
   if [[ "$ROLE" == "control-plane" ]]; then
     ok "workers join this control plane with: node-setup --role worker --server $(ts_ip)"
@@ -248,8 +302,12 @@ cmd_apply() {
   load_secrets
 
   log "plan: ${ROLE_STEPS[*]}"
+  if [[ "$RUN_PHASE" == "prepare" ]]; then
+    log "phase: prepare (disk image; boot steps are skipped)"
+  fi
   if [[ "$ROLE" == "worker" || "$ROLE" == "gateway" ]]; then
     log "control plane: $K3S_SERVER_IP"
+    log "node labels: ${K3S_NODE_LABELS[*]:-none}"
   fi
   if [[ "$DRY_RUN" == "1" ]]; then
     warn "dry-run: no changes will be made"
@@ -290,6 +348,9 @@ cmd_status() {
   else
     echo "journal:  empty"
   fi
+  if [[ -f "$CONF_DIR/image.env" ]]; then
+    echo "image:    sealed $(sed -n 's/^IMAGE_SEALED_AT=//p' "$CONF_DIR/image.env") ($CONF_DIR/image.env)"
+  fi
 }
 
 cmd_steps() {
@@ -299,8 +360,30 @@ cmd_steps() {
   load_environment
   local s
   for s in "${ROLE_STEPS[@]}"; do
-    printf '%-28s %s\n' "$s" "${STEP_DESC[$s]:-}"
+    [[ -z "$(_phase_skip_reason "$s")" ]] || continue
+    printf '%-28s %-5s %s\n' "$s" "${STEP_PHASE[$s]:--}" "${STEP_DESC[$s]:-}"
   done
+}
+
+cmd_seal() {
+  require_root
+  load_node_conf
+  [[ -n "$ROLE" ]] || die "nothing to seal: no $CONF_DIR/node.conf (run node-setup --role <role> --prepare first)"
+  RUN_PHASE=prepare
+  load_cluster_env
+  load_environment
+  local reasons line
+  reasons="$(seal_refusals "${ROLE_STEPS[@]}")"
+  if [[ -n "$reasons" ]]; then
+    while IFS= read -r line; do err "seal refused: $line"; done <<< "$reasons"
+    die "this disk cannot become an image yet; nothing was changed"
+  fi
+  seal_image
+  ok "sealed: role=$ROLE; snapshot the disk once the machine is off"
+  if [[ "$POWEROFF" == "1" ]]; then
+    log "powering off"
+    systemctl --no-block poweroff
+  fi
 }
 
 case "$CMD" in
@@ -308,4 +391,5 @@ case "$CMD" in
   doctor) cmd_doctor ;;
   status) cmd_status ;;
   steps)  cmd_steps ;;
+  seal)   cmd_seal ;;
 esac

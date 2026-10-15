@@ -39,9 +39,10 @@ provision.sh            one-command SSH provisioner (bundles setup/ + runs node-
 fleet.sh                run a command / node-setup doctor across every cluster node
 setup/
   node-setup            the on-node CLI: check -> apply -> verify, journaled + resumable
-  cluster.env           cluster-wide configuration (control-plane IP, DNS, exit-node, DB, UFW)
+  cluster.env           cluster-wide configuration (control-plane IP, DNS, exit-node, DB, UFW, worker labels)
   versions.env          pinned versions (k3s exactly; docker/tailscale apt-held after install)
-  lib/framework.sh      the step framework (idempotency, journal, reboot-resume, secrets)
+  lib/framework.sh      the step framework (idempotency, journal, phases, reboot-resume, secrets)
+  lib/seal.sh           node-setup seal: refusal checks and cleanup for disk images
   roles/                role step lists: worker.sh, gateway.sh, control-plane.sh, db.sh
   modules/              one file per capability (tailscale, docker, k3s-agent, ufw, ...)
   payloads/             scripts installed onto the node (watchdogs, exit-node routing)
@@ -76,6 +77,8 @@ Verbs beyond provisioning:
 node-setup doctor        # re-run every check/verify read-only, print a drift table
 node-setup status        # identity (role/modules/server) + step journal
 node-setup --dry-run     # print the plan without changing anything
+node-setup --role worker --prepare   # bake a disk image (no join, no identity)
+node-setup seal --poweroff           # make the prepared disk clonable, then snapshot it
 ./fleet.sh doctor        # node-setup doctor across the whole cluster
 ./fleet.sh list          # nodes with IPs, labels, status
 ```
@@ -84,7 +87,7 @@ node-setup --dry-run     # print the plan without changing anything
 
 | Role | What it becomes | Notable steps |
 |------|-----------------|---------------|
-| `worker` | k3s agent running browser workspaces via Docker | tailscale, docker, k3s-agent, ufw (80/443), flannel-watchdog, oom-guards, exit-node routing |
+| `worker` | k3s agent running browser workspaces via Docker | tailscale, docker, k3s-agent, ufw (80/443), flannel-watchdog, oom-guards, exit-node routing; preparable as a disk image |
 | `gateway` | public-facing k3s agent | as worker, public 80/443 |
 | `control-plane` | k3s server (single-node sqlite datastore) + services | k3s-server, registry secret, applies the services manifest (`--manifests`) |
 | `db` | PostgreSQL host | postgres (databases + roles + pg_hba), ufw |
@@ -97,8 +100,9 @@ in `setup/modules/` and reused across roles. See [docs/ROLES.md](docs/ROLES.md).
 Cluster-wide settings sourced by `node-setup` before roles/modules run: the
 default control-plane Tailscale IP (`--server` overrides it per run), the k3s
 datastore + secrets-encryption flags, CoreDNS DaemonSet, worker exit-node
-routing, the DB major version + database list, and UFW trusted sources / public
-ports per role.
+routing, the DB major version + database list, UFW trusted sources / public
+ports per role, and extra k3s node labels for workers (`WORKER_NODE_LABELS`,
+applied only when a worker first registers).
 
 This repo ships **`setup/cluster.env.example`** (a template with placeholder IPs
 and generic defaults), not a real `cluster.env` - per-deployment specifics stay
@@ -127,6 +131,7 @@ Supply secrets at run time - never commit them here. `provision.sh` accepts:
 Which secrets each role needs:
 
 - **worker / gateway:** `TS_AUTHKEY`, `K3S_TOKEN`
+- **worker `--prepare`:** none; `REGISTRY_SERVER/USER/PASSWORD` and `BAKE_IMAGES` to bake browser images in
 - **control-plane:** `K3S_TOKEN`, `REGISTRY_SERVER/USER/PASSWORD/EMAIL`
 - **db:** `PG_BROWSER_PASSWORD`, `PG_GUARD_PASSWORD`
 
@@ -142,11 +147,13 @@ See [docs/SECRETS.md](docs/SECRETS.md) for the full contract.
 
 ## Automated / burst provisioning
 
-The Browser API provisions temporary Hetzner workers on capacity spikes by
-booting a stock Debian image whose **cloud-init fetches this repo's tarball**,
-writes an inline `secrets.env`, and runs `node-setup --role worker --yes`. The
-node then self-registers with the control plane. Nothing about this repo is
-burst-specific - burst is just one caller of the same `node-setup`. See
+The Zesiger.net Backend adds temporary workers at OVH or Hetzner (Ubuntu 24.04)
+on capacity spikes. Each server's cloud-init fetches a pinned tarball of this
+repo, writes `cluster.env` and an inline `secrets.env`, and runs
+`node-setup --role worker --yes --server <ip>`. It boots either stock Ubuntu or
+a golden image baked with `node-setup --role worker --prepare` and
+`node-setup seal`, on which only the tailnet and k3s join remain. Nothing about
+this repo is burst-specific. See
 [docs/AUTOMATED-PROVISIONING.md](docs/AUTOMATED-PROVISIONING.md).
 
 ## Durability / failure-mode coverage
@@ -164,8 +171,9 @@ burst-specific - burst is just one caller of the same `node-setup`. See
 ## Tests
 
 ```bash
-tests/test-framework.sh   # step framework: idempotency, journal, resume
-tests/test-roles.sh       # role wiring: every role's steps resolve to modules
+tests/test-framework.sh   # step framework: idempotency, journal, phases, seal refusals
+tests/test-roles.sh       # role wiring, CLI, step behaviour with stubs, shellcheck
+tests/seal-stubs.sh       # stubbed host commands both run seal against
 ```
 
 ## License

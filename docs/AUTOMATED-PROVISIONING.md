@@ -1,31 +1,36 @@
 # Automated / burst provisioning
 
-The Browser API adds temporary Hetzner workers when the fixed fleet runs out of
-capacity, then reaps them when idle. It reuses **this repo unchanged** - burst is
-just one caller of `node-setup`.
+The Zesiger.net Backend (module `burst`) adds temporary workers to a cluster
+when its fixed fleet runs out of capacity and removes them when they are idle.
+It creates the servers at OVH Public Cloud or Hetzner Cloud, on Ubuntu 24.04,
+and every server runs **this repo's `node-setup`**: burst is one caller of the
+same worker role, nothing here is burst-specific.
 
-## Flow
+A node boots either the provider's stock Ubuntu image or a **golden image**
+the Backend baked from it with `node-setup --prepare` and `node-setup seal`.
+The cloud-init that joins the node is the same for both; on a golden image the
+journal already holds every step except the join.
 
-1. The API detects sustained capacity pressure (genuine "no host had room"
-   denials) and provisions **one** Hetzner server at a time.
-2. The server boots a stock **Debian** image with a small cloud-init `user-data`
-   that:
-   - fetches this repo's tarball from GitHub,
-   - writes an inline `/etc/node-setup/secrets.env` (`TS_AUTHKEY` + `K3S_TOKEN`),
-   - runs `node-setup --role worker --yes --server <control-plane-ip>`.
-3. `node-setup` installs tailscale -> docker -> k3s-agent and joins the cluster.
-   The node's proxy then heartbeats it into the control plane and it becomes
-   schedulable.
-4. When the node has been idle, the API deletes the Hetzner server; the ephemeral
-   Tailscale device auto-removes from the tailnet.
+## Pinned bundle and cluster.env
 
-## The cloud-init user-data
+- The bundle is a commit tarball,
+  `https://github.com/BrowserProject/browser-setup/archive/<40-hex sha>.tar.gz`,
+  never a branch: a node's setup must not change under it.
+- The cloud-init writes `setup/cluster.env` from `cluster.env.example` plus
+  the environment's overrides (exit-node routing, public ports, trusted
+  sources, `WORKER_NODE_LABELS`), byte for byte the same for the bake and for
+  every node, because the file is part of every step hash.
+- A golden image matches one bundle commit, one `cluster.env`, one `--server`
+  and one `--modules` list. Change any of them and the Backend boots stock
+  Ubuntu until it has baked a new image.
 
-Kept well under Hetzner's 32 KB user-data limit - it fetches the bundle rather
-than embedding it:
+## Joining a node
 
 ```yaml
 #cloud-config
+hostname: burst-beta-1792000000000
+fqdn: burst-beta-1792000000000
+preserve_hostname: false
 write_files:
   - path: /opt/burst-join.sh
     permissions: '0700'
@@ -33,29 +38,77 @@ write_files:
       #!/usr/bin/env bash
       set -euo pipefail
       mkdir -p /opt/node-setup /etc/node-setup
-      curl -fsSL https://github.com/BrowserProject/browser-setup/archive/refs/heads/main.tar.gz \
+      curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors '<bundle tarball>' \
         | tar -xz --strip-components=1 -C /opt/node-setup
-      cat > /etc/node-setup/secrets.env <<'EOF'
-      TS_AUTHKEY=<ephemeral, single-use, pre-authorized key>
+      cat /opt/node-setup/setup/cluster.env.example > /opt/node-setup/setup/cluster.env
+      cat >> /opt/node-setup/setup/cluster.env <<'ENV'
+      WORKER_NODE_LABELS=(browser.lol/burst=true)
+      ENV
+      umask 077
+      cat > /etc/node-setup/secrets.env <<'ENV'
+      TS_AUTHKEY=<ephemeral, single-use key for this server>
       K3S_TOKEN=<cluster join token>
-      EOF
-      chmod 600 /etc/node-setup/secrets.env
-      /opt/node-setup/setup/node-setup --role worker --yes --server <control-plane-ip>
+      ENV
+      attempt=0
+      until /opt/node-setup/setup/node-setup --role worker --yes --server <control-plane-ip>; do
+        attempt=$((attempt + 1)); [ "$attempt" -ge 3 ] && exit 1; sleep 60
+      done
+      rm -f /opt/burst-join.sh
 runcmd:
   - /opt/burst-join.sh
 ```
 
-`--strip-components=1` drops GitHub's `browser-setup-<ref>/` archive prefix, so
-`node-setup` lands at `/opt/node-setup/setup/node-setup`.
+`--strip-components=1` drops GitHub's `browser-setup-<sha>/` prefix, so
+`node-setup` lands at `/opt/node-setup/setup/node-setup`. On stock Ubuntu the
+run installs everything; on a golden image it applies `tailscale-up` and
+`k3s-agent-install`, which reuses the k3s installer and binary of the image,
+plus any step that drifted. `node-setup` shreds `secrets.env` when it is done.
+
+## Baking a golden image
+
+The Backend creates a bake VM from the stock image with the same bundle,
+`cluster.env`, `--server` and `--modules`, waits until it has powered off,
+snapshots its disk and deletes it:
+
+```bash
+# /opt/burst-bake.sh, run by cloud-init on the bake VM
+mkdir -p /opt/node-setup /etc/node-setup
+curl -fsSL ... | tar -xz --strip-components=1 -C /opt/node-setup   # same bundle
+# same cluster.env as the nodes
+umask 077
+cat > /etc/node-setup/secrets.env <<'ENV'
+REGISTRY_SERVER=<registry host>
+REGISTRY_USER=<pull-only key>
+REGISTRY_PASSWORD=<its secret>
+BAKE_IMAGES="<catalog and helper image references, space separated>"
+ENV
+/opt/node-setup/setup/node-setup --role worker --prepare --yes --server <control-plane-ip>
+rm -f /opt/burst-bake.sh /etc/node-setup/secrets.env
+/opt/node-setup/setup/node-setup seal --poweroff
+```
+
+- `--prepare` installs and journals every step except the join, pre-installs
+  k3s, and pulls `BAKE_IMAGES` (prefetch images). Without `BAKE_IMAGES` the
+  image holds no browser image (slim). A digest-pinned image on a registry
+  other than `REGISTRY_SERVER` cannot be baked under its name, so the Backend
+  leaves it out and the edge pulls it on first use.
+- The registry key is only in `secrets.env`, which `node-setup` shreds, and
+  in a docker login on tmpfs for the duration of the pulls.
+- `seal` refuses while any secret or identity is left (including the bake
+  script itself and any `write_files` target assigning a secret), so the
+  snapshot cannot capture the registry key, a join token or a tailnet node.
+  See [ROLES.md](ROLES.md#disk-images---prepare-seal) for both lists.
+- Browser images age with the image: the edge reports the node ready at once
+  and refreshes the catalog's moving tags in the background, so a node may
+  serve a bake-time build until that refresh lands. The Backend re-bakes
+  prefetch images before they get old.
 
 ## Notes
 
-- **Pin the ref** for production: fetch a tag or commit SHA tarball
-  (`.../archive/<sha>.tar.gz`) instead of `main` so a burst node's setup is
-  reproducible and unaffected by an in-flight change to this repo.
-- **Secrets inline.** The two join secrets ride the cloud-init user-data. That
-  data is readable only via the Hetzner API token, which is itself a
-  top-privilege secret, so this does not widen the blast radius; user-data can be
-  wiped post-boot. The Tailscale key is ephemeral + single-use, so it self-limits.
+- **Snapshots are regional** at OVH: an image is used in the region it was
+  made in, or copied there.
+- **Secrets in user data.** The provider API returns user data to anyone with
+  read access to the project's servers, so the join token is exposed to every
+  principal of that project. The Tailscale key is ephemeral and single-use.
 - **No manifests.** Burst nodes are workers; they never need the services
-  manifest, so nothing private is required to bring one up.
+  manifest.

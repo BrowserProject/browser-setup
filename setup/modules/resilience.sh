@@ -11,7 +11,19 @@
 # flannel-watchdog payload; this protects the rest.
 _OOM_UNITS=(k3s k3s-agent docker containerd ssh postgresql@)
 
+_oom_dropins_present() { # every guarded unit that exists carries the drop-in
+  local u
+  for u in "${_OOM_UNITS[@]}"; do
+    if systemctl cat "${u}.service" >/dev/null 2>&1; then
+      [[ -f "/etc/systemd/system/${u}.service.d/90-oom.conf" ]] || return 1
+    fi
+  done
+}
+
 STEP_DESC["oom-guards"]="OOMScoreAdjust=-900 for critical daemons (workspaces die first, never the node)"
+oom-guards::check() {
+  _oom_dropins_present
+}
 oom-guards::apply() {
   local u changed=0
   for u in "${_OOM_UNITS[@]}"; do
@@ -49,13 +61,7 @@ EOF
   return 0
 }
 oom-guards::verify() {
-  # at least one guarded unit must exist and carry the drop-in
-  local u
-  for u in "${_OOM_UNITS[@]}"; do
-    if systemctl cat "${u}.service" >/dev/null 2>&1; then
-      [[ -f "/etc/systemd/system/${u}.service.d/90-oom.conf" ]] || return 1
-    fi
-  done
+  _oom_dropins_present
 }
 
 # --- kernel table limits -----------------------------------------------------------
