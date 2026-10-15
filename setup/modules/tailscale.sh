@@ -37,7 +37,6 @@ tailscale-install::verify() {
 }
 
 STEP_DESC["tailscale-up"]="join the tailnet (prompts for an auth key) and disable auto-update"
-STEP_PHASE["tailscale-up"]=boot
 tailscale-up::check() {
   [[ "$(tailscale status --json 2>/dev/null | jq -r .BackendState 2>/dev/null)" == "Running" ]]
 }

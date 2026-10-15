@@ -4,9 +4,9 @@
 BASE_PACKAGES=(curl jq ca-certificates gnupg lsb-release htop ufw)
 
 STEP_DESC["base-packages"]="install baseline packages + full upgrade on first run"
-# Any journal entry means the first run is done: a node or disk image that
-# upgraded once adopts this step after a pin or cluster.env change instead of
-# running the full upgrade again.
+# Any journal entry means the first run is done: a node that upgraded once
+# adopts this step after a pin or cluster.env change instead of running the
+# full upgrade again.
 base-packages::check() {
   [[ -f "$STATE_DIR/state/base-packages.hash" ]] && dpkg -s "${BASE_PACKAGES[@]}" >/dev/null 2>&1
 }
