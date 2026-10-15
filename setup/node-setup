@@ -48,7 +48,7 @@ export PAYLOAD_DIR MANIFEST_DIR VERSIONS_FILE CLUSTER_ENV_FILE
 source "$SETUP_DIR/lib/framework.sh"
 
 ROLES=(worker gateway control-plane db)
-OPTIONAL_MODULES=(deadssd direct-egress alt-tailscale-port)
+OPTIONAL_MODULES=(deadssd direct-egress alt-tailscale-port profile-share profile-share-server)
 
 usage() { sed -n "3,/^set /{/^#/s/^# \{0,1\}//p}" "$0"; }
 
@@ -132,6 +132,8 @@ guided_setup() {
       [[ "$m" == "deadssd"    ]] && hint="(dying-disk nodes only: containerd on tmpfs)"
       [[ "$m" == "direct-egress" ]] && hint="(workers whose sessions leave through their own address, no Mullvad)"
       [[ "$m" == "alt-tailscale-port" ]] && hint="(providers that filter WireGuard on UDP 41641, e.g. ZAP-Hosting)"
+      [[ "$m" == "profile-share" ]] && hint="(premium workers: saved-profile NFS share; PROFILE_SHARE_EXPORT, PROFILE_SHARE_DOMAIN and PROFILE_SCRATCH_GIB (default 24) in cluster.env)"
+      [[ "$m" == "profile-share-server" ]] && hint="(beta-w1 only, with profile-share: serves the share from a local image; PROFILE_SHARE_SERVER_GIB (default 40))"
       local reply
       read -r -p "Enable optional module '$m' $hint? [y/N] " reply
       [[ "$reply" =~ ^[Yy] ]] && mods+=("$m")
@@ -211,6 +213,29 @@ load_environment() {
           ROLE_STEPS=("${steps[@]}") ;;
       esac
     done
+    local share=0 server=0
+    [[ ",$EXTRA_MODULES," == *,profile-share,* ]] && share=1
+    [[ ",$EXTRA_MODULES," == *,profile-share-server,* ]] && server=1
+    if (( server && ! share )); then
+      die "optional module profile-share-server requires profile-share"
+    fi
+    if (( share )); then
+      [[ "$ROLE" == "worker" ]] || die "optional module profile-share is for the worker role only"
+      local gate=off
+      [[ "$CMD" == "apply" ]] && gate=die
+      [[ "$CMD" == "apply" && "$DRY_RUN" == "1" ]] && gate=warn
+      profile_share_configure "$server" "$gate"
+      # the share is ready before the agent joins, so the edge never starts without it
+      local share_steps=(profile-share-kernel profile-share-scratch)
+      (( server )) && share_steps+=(profile-share-export)
+      share_steps+=(profile-share-mount profile-share-units)
+      local steps=() step
+      for step in "${ROLE_STEPS[@]}"; do
+        [[ "$step" == k3s-agent-install ]] && steps+=("${share_steps[@]}")
+        steps+=("$step")
+      done
+      ROLE_STEPS=("${steps[@]}")
+    fi
   fi
 
   # A --only/--skip name outside this plan would skip every step and still

@@ -30,6 +30,8 @@ if command -v shellcheck >/dev/null; then
   SC_FILES=("$INFRA/setup/node-setup" "$INFRA/setup/lib/framework.sh"
             "$INFRA"/setup/modules/*.sh "$INFRA"/setup/roles/*.sh
             "$INFRA/setup/payloads/flannel-watchdog.sh"
+            "$INFRA/setup/payloads/profile-share-ensure.sh"
+            "$INFRA/setup/payloads/profiles-detach.sh"
             "$INFRA/provision.sh" "$INFRA/fleet.sh")
   if shellcheck -x -e SC1090,SC1091,SC2034,SC2317 "${SC_FILES[@]}"; then
     ok "shellcheck clean (${#SC_FILES[@]} files)"
@@ -269,6 +271,182 @@ else
   fail "tailscale-alt-port placement"; echo "$out" | tail -5
 fi
 rm -rf "$SB"
+
+echo "== 3g. profile-share =="
+export PROFILE_SHARE_EXPORT="10.88.0.5:/shares/abc" PROFILE_SHARE_DOMAIN="prod-location-7"
+SERVER_EXPORT="127.0.0.1:/srv/browser-profile-share"
+SB="$(mktemp -d)"
+ns() { # ns <args...>: node-setup in a fresh sandbox, output on stdout, its rc
+  local box rc
+  box="$(mktemp -d "$SB/run.XXXXXX")"
+  NODE_SETUP_STATE_DIR="$box/state" NODE_SETUP_CONF_DIR="$box/conf" NO_COLOR=1 \
+    "$INFRA/setup/node-setup" "$@" 2>&1
+  rc=$?
+  return "$rc"
+}
+plan_of() { ns steps --role worker --modules "$1" | awk '{print $1}' | tr '\n' ' '; }
+plan="$(plan_of direct-egress,profile-share)"
+if [[ "$plan" == *"session-isolation profile-share-kernel profile-share-scratch profile-share-mount profile-share-units k3s-agent-install "* \
+      && "$plan" == *" direct-egress " && "$plan" != *exitnode-routing* ]]; then
+  ok "profile-share steps run before the agent joins; direct-egress stays last"
+else
+  fail "profile-share step order: $plan"
+fi
+plan="$(PROFILE_SHARE_EXPORT="$SERVER_EXPORT" PROFILE_SHARE_DOMAIN=beta-location-3 plan_of profile-share,profile-share-server)"
+if [[ "$plan" == *"profile-share-kernel profile-share-scratch profile-share-export profile-share-mount profile-share-units k3s-agent-install "* ]]; then
+  ok "profile-share-server exports before the mount"
+else
+  fail "profile-share-server step order: $plan"
+fi
+if out="$(ns --role worker --modules profile-share --dry-run --yes)" && grep -q "dry-run complete" <<< "$out"; then
+  ok "dry-run profile-share with default sizes"
+else
+  fail "dry-run profile-share"; echo "$out" | tail -5
+fi
+if out="$(PROFILE_SHARE_EXPORT="$SERVER_EXPORT" PROFILE_SHARE_DOMAIN=beta-location-3 PROFILE_SCRATCH_GIB=6 PROFILE_SHARE_SERVER_GIB=16 \
+          ns --role worker --modules profile-share,profile-share-server --dry-run --yes)" \
+   && grep -q "dry-run complete" <<< "$out"; then
+  ok "dry-run profile-share-server with overridden sizes"
+else
+  fail "dry-run profile-share-server"; echo "$out" | tail -5
+fi
+refused() { # refused <label> <expected message part> <env...> -- <node-setup args...>
+  local label="$1" want="$2" envs=() out
+  shift 2
+  while [[ "$1" != "--" ]]; do envs+=("$1"); shift; done
+  shift
+  if out="$(for e in "${envs[@]}"; do export "${e?}"; done; ns "$@")"; then
+    fail "$label should be refused"
+  elif grep -qF -- "$want" <<< "$out"; then
+    ok "$label refused"
+  else
+    fail "$label refused for another reason"; echo "$out" | tail -3
+  fi
+}
+W=(--role worker --modules profile-share --dry-run --yes)
+refused "a missing PROFILE_SHARE_DOMAIN" "PROFILE_SHARE_DOMAIN ''" PROFILE_SHARE_DOMAIN= -- "${W[@]}"
+refused "a missing PROFILE_SHARE_EXPORT" "PROFILE_SHARE_EXPORT ''" PROFILE_SHARE_EXPORT= -- "${W[@]}"
+refused "a 192.168.1.5 export" "must be <10.x.y.z|127.0.0.1>" PROFILE_SHARE_EXPORT=192.168.1.5:/x -- "${W[@]}"
+refused "a 10.42.0.9 export" "outside 10.42.0.0/16" PROFILE_SHARE_EXPORT=10.42.0.9:/x -- "${W[@]}"
+refused "a bad domain" "must match (prod|beta)-location-<id>" PROFILE_SHARE_DOMAIN=prod-gra11 -- "${W[@]}"
+refused "PROFILE_SCRATCH_GIB=3" "PROFILE_SCRATCH_GIB '3'" PROFILE_SCRATCH_GIB=3 -- "${W[@]}"
+refused "PROFILE_SHARE_SERVER_GIB=x" "PROFILE_SHARE_SERVER_GIB 'x'" PROFILE_SHARE_EXPORT="$SERVER_EXPORT" PROFILE_SHARE_SERVER_GIB=x \
+  -- --role worker --modules profile-share,profile-share-server --dry-run --yes
+refused "profile-share-server without profile-share" "requires profile-share" PROFILE_SHARE_EXPORT="$SERVER_EXPORT" \
+  -- --role worker --modules profile-share-server --dry-run --yes
+refused "a loopback export without profile-share-server" "needs the profile-share-server module" PROFILE_SHARE_EXPORT="$SERVER_EXPORT" -- "${W[@]}"
+refused "profile-share on a gateway" "worker role only" -- --role gateway --modules profile-share --dry-run --yes
+
+# shellcheck disable=SC1091
+share_helpers() { # runs "$@" with the module's helpers sourced and ip/df stubbed
+  (
+    export NODE_SETUP_STATE_DIR="$SB/state"
+    source "$INFRA/setup/lib/framework.sh"
+    source "$INFRA/setup/modules/profile-share.sh"
+    source "$INFRA/setup/modules/profile-share-server.sh"
+    ip() {
+      case "$*" in
+        "-o route get 10.88.0.5") echo "10.88.0.5 dev ens4 src 10.88.0.20 uid 0" ;;
+        "-o route get 10.1.2.3") echo "10.1.2.3 via 51.1.1.1 dev ens3 src 51.1.1.9 uid 0" ;;
+        "-o route get 10.9.0.5") echo "10.9.0.5 dev ens5 src 10.9.0.20 uid 0" ;;
+        "-o route get 127.0.0.1") echo "local 127.0.0.1 dev lo table local src 127.0.0.1 uid 0" ;;
+        "-o route get "*) echo "${4} dev ens4 uid 0" ;;
+        "-o route show default") printf '%s\n' "default via 51.1.1.1 dev ens3 proto dhcp" "default via 10.9.0.1 dev ens5 metric 900" ;;
+      esac
+    }
+    df() { printf 'Avail\n%s\n' "${STUB_AVAIL:-0}"; }
+    "$@"
+  ) >/dev/null 2>&1
+}
+if share_helpers _share_ip_ok 10.88.0.5 && share_helpers _share_ip_ok 127.0.0.1; then
+  ok "_share_ip_ok accepts a private-NIC share and loopback"
+else
+  fail "_share_ip_ok refused a valid share address"
+fi
+for bad in 10.42.0.9 10.43.1.1 192.168.1.5 10.1.2.3 10.9.0.5; do
+  if share_helpers _share_ip_ok "$bad"; then fail "_share_ip_ok accepted $bad"; else ok "_share_ip_ok refuses $bad"; fi
+done
+gate() { # gate <avail> <server 0|1>
+  STUB_AVAIL="$1" share_helpers eval "PROFILE_SCRATCH_IMG=$SB/none.img PROFILE_SHARE_SERVER_IMG=$SB/none2.img PROFILE_SCRATCH_GIB=24 PROFILE_SHARE_SERVER_GIB=40 PROFILE_SHARE_SERVER=$2; _profile_disk_gate"
+}
+if gate 44 0 && ! gate 43 0 && gate 84 1 && ! gate 83 1; then
+  ok "disk gate: missing images plus a 20 GiB floor"
+else
+  fail "disk gate thresholds"
+fi
+touch "$SB/none.img"
+if gate 60 1 && ! gate 59 1; then ok "disk gate: an existing image counts 0"; else fail "disk gate with an existing image"; fi
+printf 'keep\n# BEGIN node-setup x\nold\n# END node-setup x\n' > "$SB/fstab"
+if share_helpers _ps_block_is "$SB/fstab" "node-setup x" old && ! share_helpers _ps_block_is "$SB/fstab" "node-setup x" new; then
+  ok "_ps_block_is compares a managed block"
+else
+  fail "_ps_block_is"
+fi
+# Without jq on the test host a stub prints what `jq -cn` prints.
+JQ_STUB=""
+if ! command -v jq >/dev/null; then
+  # shellcheck disable=SC2016 # evaluated in the helper shell
+  JQ_STUB='jq() { local d c h; while (( $# )); do case "$1" in --arg) case "$2" in d) d=$3;; c) c=$3;; h) h=$3;; esac; shift 3;; *) shift;; esac; done; printf "{\"domain\":\"%s\",\"createdAt\":\"%s\",\"createdBy\":\"%s\"}\n" "$d" "$c" "$h"; };'
+fi
+mkdir -p "$SB/share"
+share_helpers eval "$JQ_STUB PROFILE_SHARE_MOUNT=$SB/share PROFILE_SHARE_DOMAIN=beta-location-3; _ps_write_marker"
+share_helpers eval "$JQ_STUB PROFILE_SHARE_MOUNT=$SB/share PROFILE_SHARE_DOMAIN=beta-location-9; _ps_write_marker"
+marker="$(cat "$SB/share/.browser-profile-share.json" 2>/dev/null)"
+if [[ "$marker" =~ ^\{\"domain\":\"beta-location-3\",\"createdAt\":\"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z\",\"createdBy\":\"[^\"]+\"\}$ ]] \
+   && [[ "$(stat -c %a "$SB/share/.browser-profile-share.json")" == 644 ]]; then
+  ok "share marker: written once (O_EXCL), {domain,createdAt,createdBy}, 0644"
+else
+  fail "share marker: $marker"
+fi
+rm -rf "$SB"
+unset PROFILE_SHARE_EXPORT PROFILE_SHARE_DOMAIN
+
+echo "== 3h. profile-share images and mount points (root + loop devices) =="
+if [[ "$(id -u)" == 0 ]] && losetup -f >/dev/null 2>&1 && command -v mkfs.ext4 >/dev/null; then
+  SB="$(mktemp -d)"
+  img_helpers() { # sizes in 16 MiB units instead of GiB
+    (
+      export NODE_SETUP_STATE_DIR="$SB/state"
+      source "$INFRA/setup/lib/framework.sh"
+      source "$INFRA/setup/modules/profile-share.sh"
+      PROFILE_SHARE_GIB_BYTES=16777216 PROFILE_SCRATCH_IMG="$SB/scratch.img" PROFILE_SCRATCH_GIB=4
+      df() { printf 'Avail\n999\n'; }
+      _run_fn "$*"
+    ) >/dev/null 2>&1
+  }
+  mkdir -p "$SB/mnt"
+  if img_helpers _ps_image "$SB/scratch.img" 4 brl-scratch \
+     && [[ "$(stat -c %s "$SB/scratch.img")" == 67108864 && "$(blkid -p -s LABEL -o value "$SB/scratch.img")" == brl-scratch ]] \
+     && [[ ! -e "$SB/scratch.img.tmp" ]]; then
+    ok "image: created at the fixed size, ext4, labelled"
+  else
+    fail "image creation"
+  fi
+  fallocate -p -o 33554432 -l 1048576 "$SB/scratch.img"
+  img_helpers _ps_image "$SB/scratch.img" 4 brl-scratch
+  read -r blocks bsize < <(stat -c '%b %B' "$SB/scratch.img")
+  if (( blocks * bsize >= 67108864 )); then ok "image: a re-run re-allocates a punched hole"; else fail "image stays sparse after a re-run"; fi
+  if img_helpers _ps_image "$SB/scratch.img" 5 brl-scratch; then fail "image: a size change should be refused"; else ok "image: a size change is refused"; fi
+  if img_helpers _ps_mount_point "$SB/mnt" && lsattr -d "$SB/mnt" 2>/dev/null | cut -d' ' -f1 | grep -q i; then
+    ok "mount point: empty and unmounted -> immutable"
+  else
+    fail "mount point immutable flag"
+  fi
+  mount -o loop "$SB/scratch.img" "$SB/mnt"
+  if img_helpers _ps_image_ok "$SB/scratch.img" 4 "$SB/mnt" && img_helpers _ps_mount_point "$SB/mnt"; then
+    ok "image: mounted on a loop backed by the image, fully allocated"
+  else
+    fail "image check on the mounted image"
+  fi
+  if img_helpers _ps_image_ok "$SB/scratch.img" 5 "$SB/mnt"; then fail "image check accepted a wrong size"; else ok "image check refuses a wrong size"; fi
+  umount "$SB/mnt"
+  chattr -i "$SB/mnt"
+  mkdir -p "$SB/full" && touch "$SB/full/x"
+  if img_helpers _ps_mount_point "$SB/full"; then fail "mount point: a non-empty directory should be refused"; else ok "mount point: a non-empty unmounted directory is refused"; fi
+  rm -rf "$SB"
+else
+  echo "  (needs root and a free loop device; skipping)"
+fi
 
 echo "== 4. pristine-container dry-run (fresh node simulation) =="
 if docker info >/dev/null 2>&1; then

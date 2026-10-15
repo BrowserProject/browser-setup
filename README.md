@@ -93,6 +93,16 @@ node-setup --dry-run     # print the plan without changing anything
 Role step lists are plain arrays in `setup/roles/*.sh`; modules are defined once
 in `setup/modules/` and reused across roles. See [docs/ROLES.md](docs/ROLES.md).
 
+### Optional modules (`--modules a,b`)
+
+| Module | Use |
+|--------|-----|
+| `deadssd` | containerd store on tmpfs for a worker with a dying disk |
+| `direct-egress` | sessions leave through the node's own address instead of the Mullvad exit node |
+| `alt-tailscale-port` | tailscaled on UDP 41700 for providers that filter 41641 |
+| `profile-share` | premium workers: the region's saved-profile NFS share, its kernel settings and a fixed cache scratch (`PROFILE_SHARE_EXPORT`, `PROFILE_SHARE_DOMAIN`, `PROFILE_SCRATCH_GIB`) |
+| `profile-share-server` | beta-w1 only, with `profile-share`: serves the share from a local image over loopback (`PROFILE_SHARE_SERVER_GIB`) |
+
 ## Configuration: `setup/cluster.env`
 
 Cluster-wide settings sourced by `node-setup` before roles/modules run: the

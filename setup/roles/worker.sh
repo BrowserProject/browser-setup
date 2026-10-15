@@ -1,5 +1,6 @@
 # role: worker - k3s agent that runs browser workspaces via Docker.
-# Optional extras (via --modules): deadssd, direct-egress.
+# Optional extras (via --modules): deadssd, direct-egress, alt-tailscale-port,
+# profile-share (premium workers), profile-share-server (beta-w1, with profile-share).
 # shellcheck shell=bash
 
 UFW_PUBLIC_TCP=("${WORKER_PUBLIC_TCP[@]}")

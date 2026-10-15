@@ -59,6 +59,22 @@ stays in a subshell so only `secrets.env` is private; the `--modules` list is
 the environment's own setting. The run installs everything and joins the
 tailnet and the cluster; `node-setup` shreds `secrets.env` when it is done.
 
+## Premium workers
+
+The Backend's premium lane runs the same join with
+`--modules direct-egress,profile-share` and appends the region's share to
+`cluster.env`:
+
+```
+PROFILE_SHARE_EXPORT="<the region's export, 10.x.y.z:/path>"
+PROFILE_SHARE_DOMAIN="<prod|beta>-location-<Locations.id>"
+```
+
+The domain comes from the platform's burst state unchanged; `PROFILE_SCRATCH_GIB`
+keeps its default unless the lane sets it. The node then mounts the share,
+checks its marker and arms the shutdown detach before the k3s agent joins
+([ROLES.md](ROLES.md#saved-profile-share-profile-share-profile-share-server)).
+
 ## Notes
 
 - **Secrets in user data.** The provider API returns user data to anyone with
