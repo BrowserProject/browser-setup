@@ -10,6 +10,7 @@ trap 'rm -rf "$SANDBOX"' EXIT
 
 export NODE_SETUP_STATE_DIR="$SANDBOX/state"
 export NODE_SETUP_CONF_DIR="$SANDBOX/conf"
+export NODE_SETUP_RUN_DIR="$SANDBOX/run"
 export NO_COLOR=1
 mkdir -p "$NODE_SETUP_STATE_DIR" "$NODE_SETUP_CONF_DIR"
 
@@ -101,10 +102,13 @@ echo "== step processes see every variable =="
 _UNDERSCORE_UNITS=(a b)
 UIDS_LIKE="kept"
 STEP_DESC[vars]="reads globals"
-vars::apply() { printf '%s %s\n' "${_UNDERSCORE_UNITS[*]}" "$UIDS_LIKE" > "$SANDBOX/vars-seen"; }
+vars::apply() { printf '%s %s %s\n' "${_UNDERSCORE_UNITS[*]}" "$UIDS_LIKE" "$0" > "$SANDBOX/vars-seen"; }
 t "step with globals runs"         run_steps vars
-t "_-prefixed and special-prefixed names reach the step" test "$(cat "$SANDBOX/vars-seen")" = "a b kept"
-t "no step script is left behind"  test -z "$(find "$NODE_SETUP_STATE_DIR" -name '.step.*')"
+read -r seen_a seen_b seen_kept seen_script < "$SANDBOX/vars-seen"
+t "_-prefixed and special-prefixed names reach the step" test "$seen_a $seen_b $seen_kept" = "a b kept"
+# The step script carries every secret: tmpfs only, never the state dir.
+t "the step ran from a script in RUN_DIR" test "${seen_script%/*}" = "$NODE_SETUP_RUN_DIR"
+t "no step script is left behind"  test -z "$(find "$NODE_SETUP_RUN_DIR" "$NODE_SETUP_STATE_DIR" -name '*step.*')"
 
 echo "== failing verify aborts =="
 STEP_DESC[bad]="failing step"

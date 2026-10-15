@@ -18,6 +18,7 @@ tailscale-install::apply() {
     case "$distro" in ubuntu|debian) ;; *) distro="ubuntu" ;; esac
     curl -fsSL "https://pkgs.tailscale.com/stable/${distro}/${codename}.noarmor.gpg" \
       -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+    chmod a+r /usr/share/keyrings/tailscale-archive-keyring.gpg
     echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/${distro} ${codename} main" \
       > /etc/apt/sources.list.d/tailscale.list
     apt-get update

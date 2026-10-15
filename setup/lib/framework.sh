@@ -20,6 +20,7 @@
 # --- paths (overridable for tests) -------------------------------------------
 STATE_DIR="${NODE_SETUP_STATE_DIR:-/var/lib/node-setup}"
 CONF_DIR="${NODE_SETUP_CONF_DIR:-/etc/node-setup}"
+RUN_DIR="${NODE_SETUP_RUN_DIR:-/run/node-setup}"   # tmpfs: step scripts hold secrets
 LOG_FILE="$STATE_DIR/setup.log"
 
 # --- flags (set by the CLI) ---------------------------------------------------
@@ -238,7 +239,8 @@ _has_fn() { declare -F "$1" >/dev/null 2>&1; }
 # functions) is serialized in; results travel back via files, never variables.
 _run_fn() {
   local fn="$1" script rc=0
-  script="$(mktemp "$STATE_DIR/.step.XXXXXX")"
+  install -d -m 0700 "$RUN_DIR"
+  script="$(mktemp "$RUN_DIR/step.XXXXXX")"
   {
     # exclude bash-special / readonly names; everything else (cluster env,
     # role arrays, secrets, framework globals) is re-declared in the child
@@ -264,7 +266,7 @@ _step_selected() {
 run_steps() {
   local step hash state_file
   mkdir -p "$STATE_DIR/state" "$STATE_DIR/rebooted-for"
-  chmod 700 "$STATE_DIR"   # step scripts serialize secrets through here
+  chmod 700 "$STATE_DIR"
 
   for step in "$@"; do
     _step_selected "$step" || { log "[$step] skipped (--only/--skip)"; continue; }

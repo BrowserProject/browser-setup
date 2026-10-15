@@ -5,7 +5,8 @@ One-command, idempotent provisioning for the Browser / Guard cluster nodes.
 Everything needed to turn a fresh Ubuntu/Debian box into a working cluster node
 (k3s + Tailscale + Docker, role-specific hardening and services) lives here. It
 is the single source of truth for node setup, used both for **manual**
-provisioning and by the API's **automated burst-capacity** provisioner.
+provisioning and by the Zesiger.net Backend's **automated burst-capacity**
+provisioner (see [Automated / burst provisioning](#automated--burst-provisioning)).
 
 ```bash
 # a fresh prod worker (run from a checkout of this repo)

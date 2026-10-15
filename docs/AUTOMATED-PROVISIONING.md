@@ -23,6 +23,7 @@ nothing here is burst-specific.
 hostname: burst-beta-1792000000000
 fqdn: burst-beta-1792000000000
 preserve_hostname: false
+prefer_fqdn_over_hostname: false
 write_files:
   - path: /opt/burst-join.sh
     permissions: '0700'
@@ -36,13 +37,15 @@ write_files:
       cat >> /opt/node-setup/setup/cluster.env <<'ENV'
       WORKER_NODE_LABELS=(browser.lol/burst=true)
       ENV
+      (
       umask 077
       cat > /etc/node-setup/secrets.env <<'ENV'
       TS_AUTHKEY=<ephemeral, single-use key for this server>
       K3S_TOKEN=<cluster join token>
       ENV
+      )
       attempt=0
-      until /opt/node-setup/setup/node-setup --role worker --yes --server <control-plane-ip>; do
+      until /opt/node-setup/setup/node-setup --role worker --yes --server <control-plane-ip> --modules direct-egress; do
         attempt=$((attempt + 1)); [ "$attempt" -ge 3 ] && exit 1; sleep 60
       done
       rm -f /opt/burst-join.sh
@@ -51,9 +54,10 @@ runcmd:
 ```
 
 `--strip-components=1` drops GitHub's `browser-setup-<sha>/` prefix, so
-`node-setup` lands at `/opt/node-setup/setup/node-setup`. The run installs
-everything and joins the tailnet and the cluster; `node-setup` shreds
-`secrets.env` when it is done.
+`node-setup` lands at `/opt/node-setup/setup/node-setup`. The `umask 077`
+stays in a subshell so only `secrets.env` is private; the `--modules` list is
+the environment's own setting. The run installs everything and joins the
+tailnet and the cluster; `node-setup` shreds `secrets.env` when it is done.
 
 ## Notes
 

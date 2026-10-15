@@ -14,6 +14,9 @@ ok()   { PASS=$((PASS+1)); echo "  ok  $*"; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL $*"; }
 
 MATRIX=(worker gateway control-plane db)
+NODE_SETUP_RUN_DIR="$(mktemp -d)"
+export NODE_SETUP_RUN_DIR
+trap 'rm -rf "$NODE_SETUP_RUN_DIR"' EXIT
 
 echo "== 1. bash -n syntax =="
 while IFS= read -r f; do
