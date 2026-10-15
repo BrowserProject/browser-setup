@@ -34,7 +34,7 @@ _ps_export_ok() {
     && [[ "$(nfsconf --get nfsd lease-time)" == 90 ]] \
     && [[ "$(cat /proc/fs/nfsd/nfsv4leasetime 2>/dev/null)" == 90 ]] \
     || return 1
-  exported="$(exportfs -s | awk -v d="$PROFILE_SHARE_SERVER_DIR" '$1 == d {print $2}')"
+  exported="$(exportfs -s | awk -v d="$PROFILE_SHARE_SERVER_DIR" '$1 == d { if (NF < 2) getline; print $NF }')"
   [[ "$exported" == "127.0.0.1("*")" && "$exported" == *[\(,]rw[,\)]* && "$exported" == *no_root_squash* ]] || return 1
   listeners="$(ss -ltnH 'sport = :2049' | awk '{print $4}' | sort -u)"
   [[ "$listeners" == 127.0.0.1:2049 ]]
