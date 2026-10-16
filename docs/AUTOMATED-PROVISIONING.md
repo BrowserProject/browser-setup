@@ -66,12 +66,14 @@ The Backend's premium lane runs the same join with
 `cluster.env`:
 
 ```
-PROFILE_SHARE_EXPORT="<the region's export, 10.x.y.z:/path>"
-PROFILE_SHARE_DOMAIN="<prod|beta>-location-<Locations.id>"
+PROFILE_SHARE_EXPORT=10.x.y.z:/path
+PROFILE_SHARE_DOMAIN=<prod|beta>-location-<Locations.id>
 ```
 
-The domain comes from the platform's burst state unchanged; `PROFILE_SCRATCH_GIB`
-keeps its default unless the lane sets it. The node then mounts the share,
+The domain comes from the platform's burst state unchanged. Burst nodes always
+use the default `PROFILE_SCRATCH_GIB` (24): the Backend allows only
+`PROFILE_SHARE_EXPORT` and `PROFILE_SHARE_DOMAIN` as extra cluster.env values,
+and a lane's `cluster_env` table cannot set it. The node then mounts the share,
 checks its marker and arms the shutdown detach before the k3s agent joins
 ([ROLES.md](ROLES.md#saved-profile-share-profile-share-profile-share-server)).
 

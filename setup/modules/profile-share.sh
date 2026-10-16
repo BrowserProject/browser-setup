@@ -270,18 +270,21 @@ _ps_share_ok() {
 }
 
 # Claims an empty share with an exclusive create (noclobber is O_EXCL), so two
-# nodes racing on a fresh share end up with one marker.
+# nodes racing on a fresh share end up with one marker. A marker this run
+# created but did not finish is removed again, so no node is left with an
+# empty one.
 _ps_write_marker() {
   local marker="$PROFILE_SHARE_MOUNT/$PROFILE_SHARE_MARKER" out rc=0
-  out="$( (set -o noclobber
-           jq -cn --arg d "$PROFILE_SHARE_DOMAIN" --arg c "$(date -u +%FT%TZ)" --arg h "$(hostname)" \
-             '{domain: $d, createdAt: $c, createdBy: $h}' > "$marker") 2>&1)" || rc=$?
+  # shellcheck disable=SC2016 # expanded by the inner bash and jq
+  out="$(timeout -k 5 30 bash -c 'set -o noclobber; jq -cn --arg d "$1" --arg c "$2" --arg h "$3" "{domain:\$d,createdAt:\$c,createdBy:\$h}" > "$4"' \
+    _ "$PROFILE_SHARE_DOMAIN" "$(date -u +%FT%TZ)" "$(hostname)" "$marker" 2>&1)" || rc=$?
   if (( rc != 0 )); then
     [[ "$out" == *"Permission denied"* ]] && die "root squash on the share: root cannot create $marker"
-    [[ -e "$marker" ]] || die "writing $marker failed: $out"
-    return 0
+    [[ "$out" == *"cannot overwrite existing file"* ]] && return 0
+    timeout -k 5 20 rm -f "$marker" || true
+    die "writing $marker failed (exit $rc): $out"
   fi
-  chmod 0644 "$marker"
+  timeout -k 5 20 chmod 0644 "$marker"
 }
 
 STEP_DESC["profile-share-mount"]="mount the region's profile share at $PROFILE_SHARE_MOUNT (NFSv4.2, hard), check its marker and layout"
@@ -310,7 +313,7 @@ profile-share-mount::apply() {
     [[ -z "$entries" ]] || die "the share has no $PROFILE_SHARE_MARKER but is not empty; refusing to claim it"
     _ps_write_marker
   fi
-  domain="$(_ps_marker_domain)" || die "$m/$PROFILE_SHARE_MARKER is not JSON with a domain"
+  domain="$(retry 3 5 _ps_marker_domain)" || die "$m/$PROFILE_SHARE_MARKER is not JSON with a domain"
   [[ "$domain" == "$PROFILE_SHARE_DOMAIN" ]] \
     || die "the share belongs to '$domain', this node is configured for '$PROFILE_SHARE_DOMAIN'"
   timeout -k 5 30 install -d -m 0700 "$m/images" "$m/probe"
@@ -348,6 +351,7 @@ Description=Retry the saved-profile share mount
 [Timer]
 OnBootSec=30s
 OnUnitActiveSec=60s
+AccuracySec=1s
 
 [Install]
 WantedBy=timers.target

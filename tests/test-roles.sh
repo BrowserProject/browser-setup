@@ -386,9 +386,18 @@ fi
 JQ_STUB=""
 if ! command -v jq >/dev/null; then
   # shellcheck disable=SC2016 # evaluated in the helper shell
-  JQ_STUB='jq() { local d c h; while (( $# )); do case "$1" in --arg) case "$2" in d) d=$3;; c) c=$3;; h) h=$3;; esac; shift 3;; *) shift;; esac; done; printf "{\"domain\":\"%s\",\"createdAt\":\"%s\",\"createdBy\":\"%s\"}\n" "$d" "$c" "$h"; };'
+  JQ_STUB='jq() { local d c h; while (( $# )); do case "$1" in --arg) case "$2" in d) d=$3;; c) c=$3;; h) h=$3;; esac; shift 3;; *) shift;; esac; done; printf "{\"domain\":\"%s\",\"createdAt\":\"%s\",\"createdBy\":\"%s\"}\n" "$d" "$c" "$h"; }; export -f jq;'
 fi
 mkdir -p "$SB/share"
+# A create that fails after O_EXCL leaves no empty marker behind.
+mkdir -p "$SB/share-bad"
+# shellcheck disable=SC2016 # evaluated in the helper shell
+if ! share_helpers eval 'jq() { echo partial-failure >&2; return 3; }; export -f jq; PROFILE_SHARE_MOUNT='"$SB"'/share-bad PROFILE_SHARE_DOMAIN=beta-location-3; _ps_write_marker' 2>/dev/null \
+   && [[ ! -e "$SB/share-bad/.browser-profile-share.json" ]]; then
+  ok "share marker: a failed first claim dies and removes the marker it created"
+else
+  fail "share marker: a failed first claim left $(ls -A "$SB/share-bad")"
+fi
 share_helpers eval "$JQ_STUB PROFILE_SHARE_MOUNT=$SB/share PROFILE_SHARE_DOMAIN=beta-location-3; _ps_write_marker"
 share_helpers eval "$JQ_STUB PROFILE_SHARE_MOUNT=$SB/share PROFILE_SHARE_DOMAIN=beta-location-9; _ps_write_marker"
 marker="$(cat "$SB/share/.browser-profile-share.json" 2>/dev/null)"
