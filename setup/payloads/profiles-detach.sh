@@ -6,19 +6,38 @@
 # does (drain-profile, so its last writes are flushed), stops the sessions,
 # unmounts every profile image and frees their loop devices, so no image is
 # left attached to a vanished NFS client. Scratch directories are left to the
-# edge's reconcile. No errexit: every step is attempted, within about 200 s.
+# edge's reconcile. No errexit: every step is attempted, within about 230 s.
 set -uo pipefail
 
 SHARE_IMAGES=/mnt/browser-profiles/images/
 SELFTEST_IMAGES=/var/lib/browser-profile-scratch/.selftest/
 MOUNT_ROOTS=(/run/browser-profiles/profile/ /run/browser-profiles/selftest/)
-LAZY_AFTER_S=160
-# The drains run in parallel and bound themselves (drain-profile's own deadline).
-DRAIN_DEADLINE_S=60
+LAZY_AFTER_S=190
+# The drains run in parallel; drain-profile bounds itself at 85 s.
+DRAIN_LIMIT_S=95
 # mirrored from containers/base/root/opt/scripts/drain-profile (its profile id rule). Keep in sync.
 PROFILE_ID_RE='^[a-f0-9-]{16,64}$'
 
 log() { logger -t browser-profiles-detach "$*"; }
+
+# Runs a command and waits at most <seconds> for it, never blocking on one stuck in D state on
+# a hung share (that one is left behind): 124 when the limit hit, else its exit status.
+bounded() { # seconds command...
+  local limit=$1 start=$SECONDS pid state
+  shift
+  "$@" &
+  pid=$!
+  while :; do
+    state="$(awk '{ print $3 }' "/proc/$pid/stat" 2>/dev/null)"
+    [[ -z "$state" || "$state" == Z ]] && break
+    if (( SECONDS - start >= limit )); then
+      kill -9 "$pid" 2>/dev/null
+      return 124
+    fi
+    sleep 0.2
+  done
+  wait "$pid"
+}
 
 containers=0 unmounted=0 lazy=0 loops=0
 
@@ -29,8 +48,7 @@ if (( ${#ids[@]} > 0 )); then
   for id in "${ids[@]}"; do
     profile="$(timeout 5 docker inspect -f '{{index .Config.Labels "browser.lol.profile.id"}}' "$id" 2>/dev/null)"
     [[ "$profile" =~ $PROFILE_ID_RE ]] || continue
-    timeout -k 2 $((DRAIN_DEADLINE_S + 10)) docker exec -e PROFILE_DRAIN_DEADLINE_SECONDS="$DRAIN_DEADLINE_S" \
-      "$id" /opt/scripts/drain-profile "$profile" >/dev/null 2>&1 &
+    timeout -k 2 "$DRAIN_LIMIT_S" docker exec "$id" /opt/scripts/drain-profile "$profile" >/dev/null 2>&1 &
   done
   wait
   log "stopping $containers profile containers"
@@ -46,15 +64,15 @@ mapfile -t mounts < <(awk '{ print $5 }' /proc/self/mountinfo | while read -r t;
 done | sort -rn | cut -d' ' -f2-)
 for t in "${mounts[@]}"; do
   if (( SECONDS >= LAZY_AFTER_S )); then
-    umount -l "$t" && lazy=$((lazy + 1))
+    bounded 5 umount -l "$t" && lazy=$((lazy + 1))
     log "out of time: lazy unmount of $t"
     continue
   fi
-  timeout -k 2 15 sync -f "$t" || log "sync of $t did not finish"
-  if timeout -k 2 20 umount "$t"; then
+  bounded 15 sync -f "$t" || log "sync of $t did not finish"
+  if bounded 20 umount "$t"; then
     unmounted=$((unmounted + 1))
   else
-    umount -l "$t" && lazy=$((lazy + 1))
+    bounded 5 umount -l "$t" && lazy=$((lazy + 1))
     log "lazy unmount of $t"
   fi
 done
