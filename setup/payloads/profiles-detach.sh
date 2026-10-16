@@ -2,16 +2,21 @@
 # profiles-detach.sh - installed as /usr/local/sbin/browser-profiles-detach and
 # run as ExecStop of browser-profiles-detach.service (node-setup
 # profile-share-units), i.e. at shutdown before docker stops and before the
-# profile share is unmounted. Stops every saved-profile session, flushes and
-# unmounts every profile image, and frees their loop devices, so no image is
+# profile share is unmounted. Ends every saved-profile browser the way a close
+# does (drain-profile, so its last writes are flushed), stops the sessions,
+# unmounts every profile image and frees their loop devices, so no image is
 # left attached to a vanished NFS client. Scratch directories are left to the
-# edge's reconcile. No errexit: every step is attempted, within about 120 s.
+# edge's reconcile. No errexit: every step is attempted, within about 200 s.
 set -uo pipefail
 
 SHARE_IMAGES=/mnt/browser-profiles/images/
 SELFTEST_IMAGES=/var/lib/browser-profile-scratch/.selftest/
 MOUNT_ROOTS=(/run/browser-profiles/profile/ /run/browser-profiles/selftest/)
-LAZY_AFTER_S=100
+LAZY_AFTER_S=160
+# The drains run in parallel and bound themselves (drain-profile's own deadline).
+DRAIN_DEADLINE_S=60
+# mirrored from containers/base/root/opt/scripts/drain-profile (its profile id rule). Keep in sync.
+PROFILE_ID_RE='^[a-f0-9-]{16,64}$'
 
 log() { logger -t browser-profiles-detach "$*"; }
 
@@ -20,6 +25,14 @@ containers=0 unmounted=0 lazy=0 loops=0
 mapfile -t ids < <(timeout 10 docker ps -aq --filter label=browser.lol.profile.id 2>/dev/null)
 if (( ${#ids[@]} > 0 )); then
   containers=${#ids[@]}
+  log "draining $containers profile containers"
+  for id in "${ids[@]}"; do
+    profile="$(timeout 5 docker inspect -f '{{index .Config.Labels "browser.lol.profile.id"}}' "$id" 2>/dev/null)"
+    [[ "$profile" =~ $PROFILE_ID_RE ]] || continue
+    timeout -k 2 $((DRAIN_DEADLINE_S + 10)) docker exec -e PROFILE_DRAIN_DEADLINE_SECONDS="$DRAIN_DEADLINE_S" \
+      "$id" /opt/scripts/drain-profile "$profile" >/dev/null 2>&1 &
+  done
+  wait
   log "stopping $containers profile containers"
   timeout 30 docker stop -t 10 "${ids[@]}" >/dev/null 2>&1 || log "docker stop did not finish cleanly"
   timeout 20 docker rm -f "${ids[@]}" >/dev/null 2>&1 || log "docker rm did not finish cleanly"

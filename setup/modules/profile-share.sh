@@ -372,7 +372,7 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/true
 ExecStop=/usr/local/sbin/browser-profiles-detach
-TimeoutStopSec=150
+TimeoutStopSec=210
 
 [Install]
 WantedBy=multi-user.target
