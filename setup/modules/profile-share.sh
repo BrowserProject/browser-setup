@@ -123,7 +123,7 @@ _ps_image() { # path gib label
   rm -f "$img.tmp"
   fallocate -l "$(( gib * PROFILE_SHARE_GIB_BYTES ))" "$img.tmp"
   chmod 0600 "$img.tmp"
-  mkfs.ext4 -F -q -m 0 -L "$label" -E nodiscard "$img.tmp"
+  mkfs.ext4 -F -q -m 0 -L "$label" -E nodiscard,lazy_itable_init=0,lazy_journal_init=0 "$img.tmp"
   mv "$img.tmp" "$img"
 }
 

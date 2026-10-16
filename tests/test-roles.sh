@@ -431,6 +431,14 @@ if [[ "$(id -u)" == 0 ]] && losetup -f >/dev/null 2>&1 && command -v mkfs.ext4 >
   else
     fail "image creation"
   fi
+  # the kernel's lazy init would zero these through the loop with hole punches
+  groups="$(dumpe2fs "$SB/scratch.img" 2>/dev/null | grep -c "^Group [0-9]")"
+  zeroed="$(dumpe2fs "$SB/scratch.img" 2>/dev/null | grep "^Group [0-9]" | grep -c ITABLE_ZEROED)"
+  if (( groups > 0 && zeroed == groups )); then
+    ok "image: inode tables written at mkfs, nothing left for the lazy init"
+  else
+    fail "image: $zeroed of $groups inode tables zeroed at mkfs"
+  fi
   fallocate -p -o 33554432 -l 1048576 "$SB/scratch.img"
   img_helpers _ps_image "$SB/scratch.img" 4 brl-scratch
   read -r blocks bsize < <(stat -c '%b %B' "$SB/scratch.img")
