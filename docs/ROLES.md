@@ -72,14 +72,20 @@ browser container with Docker's cgroup parent `browser.slice`. A container
 started by hand belongs there too (`docker run --cgroup-parent=browser.slice`);
 anything else outside it eats the reserve.
 
+On a `deadssd` node the store's share follows its use when applied, writable
+layers of running sessions included: apply there once the edge has pulled its
+images, and expect `doctor` to report the step drifted after the use moved by
+a whole GiB (a re-run resizes the slice).
+
 Why these values (beta, 8 GiB workers, 2026-10-18; five 600 MiB sessions and
 one growing 100 MiB/s, all in the slice):
 
 - A 1.5 GiB reserve was too small: a worker without sessions already uses
   1.1 GiB plus 0.75 GiB of hot code and page cache, and with a full slice one
-  node froze for over an hour. With 2.5 GiB the node stayed Ready, SSH answered
+  node froze for over an hour (containers started by hand outside the slice
+  ran there too). With 2.5 GiB the node stayed Ready, SSH answered
   every probe and `system.slice` saw no memory stall.
-- Without swap a full slice ends in no OOM kill: below `MemoryMax` the browsers
+- With `MemoryHigh` a full slice ends in no OOM kill: below `MemoryMax` the browsers
   evict and re-read their own code, 35 % full pressure, sessions answering every
   4 s, nothing killed in 4 minutes. Without `MemoryHigh` the kernel killed
   after about 2 minutes of the same.
@@ -88,11 +94,15 @@ one growing 100 MiB/s, all in the slice):
   because the node's free memory stays healthy while the slice stalls. A
   single container at its own limit stays with the kernel, which kills only
   its biggest process (slice pressure under 2 %, no oomd kill).
+- What follows an oomd kill is the container's restart policy: Docker
+  restarts a regular session's container (`unless-stopped`), so the session
+  goes on with a fresh browser; a saved-profile container (`no`) stays down.
 - No zram: with the slice bound the node itself never needed swap, and swap
   would need `fail-swap-on=false` on the kubelet.
 
-Rollback on a node (the journal entries keep `node-setup` from re-applying
-until the steps are removed from the role):
+Rollback on a node. A later `node-setup` run applies the steps again while the
+worker role lists them, so pass `--skip memory-slice,memory-protect,memory-oomd`
+until they are removed from it:
 
 ```bash
 systemctl disable --now systemd-oomd.service systemd-oomd.socket
