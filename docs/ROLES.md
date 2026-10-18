@@ -24,7 +24,8 @@ docker-install docker-daemon-config
 ufw-rules session-isolation
 profile-legacy-cleanup
 k3s-agent-install
-flannel-watchdog oom-guards net-limits hw-watchdog disk-guard
+flannel-watchdog oom-guards memory-slice memory-protect memory-oomd
+net-limits hw-watchdog disk-guard
 [exitnode-routing]          # when EXITNODE_ROUTING=1 in cluster.env
 ```
 
@@ -50,6 +51,58 @@ never starts on a node without its share:
 
 ```
 profile-share-kernel profile-share-scratch [profile-share-export] profile-share-mount profile-share-units
+```
+
+### Memory protection (`memory-slice`, `memory-protect`, `memory-oomd`)
+
+A worker has no swap. When its browser sessions use up the RAM, the kernel
+evicts the program code of k3s, containerd, tailscaled and sshd and reads it
+straight back in instead of killing anything, and the node freezes (NotReady,
+no SSH) for tens of minutes. The three steps (`setup/modules/memory.sh`) keep the
+browsers inside one bound and the node outside it:
+
+| Step | What it sets |
+|------|--------------|
+| `memory-slice` | `/etc/systemd/system/browser.slice`: `MemoryMax` = RAM - max(2.5 GiB, 8 % of RAM), minus a tmpfs container store (`deadssd`) rounded up to whole GiB plus one; `MemoryHigh` 95 % of that. Sized from `MemTotal` when applied; a RAM change re-applies |
+| `memory-protect` | `MemoryMin`/`MemoryLow` drop-ins `90-memory.conf` (MiB): k3s-agent 384/768, containerd 128/256, docker 128/256, tailscaled 64/128, ssh 16/32, systemd-oomd 64/64; `system.slice` gets the sums (784/1504), since a child is never protected beyond its parent. `/etc/sysctl.d/93-node-setup-memory.conf`: `vm.min_free_kbytes` 1 % of RAM within 64-256 MiB, `vm.watermark_scale_factor` 100 |
+| `memory-oomd` | `systemd-oomd`, `browser.slice.d/50-oomd.conf` `ManagedOOMMemoryPressure=kill` at 20 % full pressure, `/etc/systemd/oomd.conf.d/50-node-setup.conf` `DefaultMemoryPressureDurationSec=20s` |
+
+The slice only bounds what runs in it: the platform's edge starts every
+browser container with Docker's cgroup parent `browser.slice`. A container
+started by hand belongs there too (`docker run --cgroup-parent=browser.slice`);
+anything else outside it eats the reserve.
+
+Why these values (beta, 8 GiB workers, 2026-10-18; five 600 MiB sessions and
+one growing 100 MiB/s, all in the slice):
+
+- A 1.5 GiB reserve was too small: a worker without sessions already uses
+  1.1 GiB plus 0.75 GiB of hot code and page cache, and with a full slice one
+  node froze for over an hour. With 2.5 GiB the node stayed Ready, SSH answered
+  every probe and `system.slice` saw no memory stall.
+- Without swap a full slice ends in no OOM kill: below `MemoryMax` the browsers
+  evict and re-read their own code, 35 % full pressure, sessions answering every
+  4 s, nothing killed in 4 minutes. Without `MemoryHigh` the kernel killed
+  after about 2 minutes of the same.
+- systemd-oomd ended it 40 s after the slice filled, killing exactly the
+  growing container; earlyoom (prefer/avoid lists, `-m 10`) never fired,
+  because the node's free memory stays healthy while the slice stalls. A
+  single container at its own limit stays with the kernel, which kills only
+  its biggest process (slice pressure under 2 %, no oomd kill).
+- No zram: with the slice bound the node itself never needed swap, and swap
+  would need `fail-swap-on=false` on the kubelet.
+
+Rollback on a node (the journal entries keep `node-setup` from re-applying
+until the steps are removed from the role):
+
+```bash
+systemctl disable --now systemd-oomd.service systemd-oomd.socket
+rm -f /etc/systemd/system/browser.slice /etc/systemd/system/browser.slice.d/50-oomd.conf \
+  /etc/systemd/system/{k3s-agent,containerd,docker,tailscaled,ssh,systemd-oomd}.service.d/90-memory.conf \
+  /etc/systemd/system/system.slice.d/90-memory.conf /etc/systemd/oomd.conf.d/50-node-setup.conf \
+  /etc/sysctl.d/93-node-setup-memory.conf
+systemctl daemon-reload            # running containers keep their slice, now unbounded
+sysctl -w vm.watermark_scale_factor=10  # min_free_kbytes returns to the kernel default at the next boot
+rm -f /var/lib/node-setup/state/memory-*.hash
 ```
 
 Node labels come from `WORKER_NODE_LABELS` in `cluster.env` (empty by default);

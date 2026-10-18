@@ -261,6 +261,95 @@ else
 fi
 rm -rf "$SB"
 
+echo "== 3e2. memory protection =="
+SB="$(mktemp -d)"
+# mem <MemTotal kB> <function>: runs it in the step's child process against a
+# sandboxed systemd directory and sysctl file
+# shellcheck disable=SC1091
+mem() {
+  (
+    source "$INFRA/setup/lib/framework.sh"
+    source "$INFRA/setup/modules/memory.sh"
+    STATE_DIR="$SB" MEM_TOTAL_KB="$1" MEM_TMPFS_MIB="${MEM_TMPFS_MIB:-0}"
+    _MEM_SYSTEMD_DIR="$SB/systemd" _MEM_SYSCTL_FILE="$SB/93-memory.conf" _MEM_OOMD_CONF="$SB/oomd.conf"
+    _mem_total_kb() { echo "$MEM_TOTAL_KB"; }
+    _mem_tmpfs_store_mib() { echo "$MEM_TMPFS_MIB"; }
+    ensure_pkgs() { echo "$*" >> "$SB/pkgs"; }
+    svc_enable_now() { echo "$*" >> "$SB/enabled"; }
+    systemctl() { echo "$*" >> "$SB/systemctl"; }
+    sysctl() { echo "$*" >> "$SB/sysctl"; }
+    _run_fn "$2"
+  )
+}
+GIB8=8131584    # 7941 MiB, a beta worker
+GIB64=65536000  # 64000 MiB
+mem "$GIB8" memory-slice::apply >/dev/null 2>&1
+mem "$GIB8" memory-protect::apply >/dev/null 2>&1
+slice="$(cat "$SB/systemd/browser.slice" 2>/dev/null)"
+if grep -qx 'MemoryMax=5381M' <<< "$slice" && grep -qx 'MemoryHigh=5111M' <<< "$slice"; then
+  ok "memory-slice: 8 GiB keeps the 2.5 GiB floor (max 5381M, high 5111M)"
+else
+  fail "memory-slice 8 GiB: $(grep Memory <<< "$slice" | tr '\n' ' ')"
+fi
+if mem "$GIB8" memory-slice::check && mem "$GIB8" memory-protect::check; then
+  ok "memory: check passes after apply"
+else
+  fail "memory: check fails after apply"
+fi
+if ! mem "$GIB64" memory-slice::check && ! mem "$GIB64" memory-protect::check; then
+  ok "memory: a RAM change fails the check (re-applies)"
+else
+  fail "memory: a RAM change passed the check"
+fi
+if grep -qx 'MemoryMin=384M' "$SB/systemd/k3s-agent.service.d/90-memory.conf" 2>/dev/null \
+   && grep -qx 'MemoryLow=32M' "$SB/systemd/ssh.service.d/90-memory.conf" 2>/dev/null \
+   && grep -qx 'MemoryMin=784M' "$SB/systemd/system.slice.d/90-memory.conf" 2>/dev/null \
+   && grep -qx 'MemoryLow=1504M' "$SB/systemd/system.slice.d/90-memory.conf" 2>/dev/null \
+   && grep -qx 'vm.min_free_kbytes = 81315' "$SB/93-memory.conf" 2>/dev/null \
+   && grep -qx 'vm.watermark_scale_factor = 100' "$SB/93-memory.conf" 2>/dev/null; then
+  ok "memory-protect: service drop-ins, system.slice sums, reclaim sysctls"
+else
+  fail "memory-protect files: $(cat "$SB/systemd/system.slice.d/90-memory.conf" "$SB/93-memory.conf" 2>/dev/null | grep -v '^#' | tr '\n' ' ')"
+fi
+touch -d '-1 min' "$SB"/systemd/*.slice "$SB"/systemd/*/*.conf "$SB/93-memory.conf"
+touch "$SB/stamp"
+mem "$GIB8" memory-slice::apply >/dev/null 2>&1
+mem "$GIB8" memory-protect::apply >/dev/null 2>&1
+if [[ -z "$(find "$SB/systemd" "$SB/93-memory.conf" -type f -newer "$SB/stamp")" ]]; then
+  ok "memory: a re-run rewrites nothing"
+else
+  fail "memory: a re-run rewrote $(find "$SB/systemd" -type f -newer "$SB/stamp" | tr '\n' ' ')"
+fi
+rm -rf "$SB"; SB="$(mktemp -d)"
+mem "$GIB64" memory-slice::apply >/dev/null 2>&1
+mem "$GIB64" memory-protect::apply >/dev/null 2>&1
+if grep -qx 'MemoryMax=58880M' "$SB/systemd/browser.slice" 2>/dev/null \
+   && grep -qx 'vm.min_free_kbytes = 262144' "$SB/93-memory.conf" 2>/dev/null; then
+  ok "memory: 64 GB reserves 8 % (max 58880M), min_free_kbytes capped at 256 MiB"
+else
+  fail "memory 64 GB: $(grep -h 'MemoryMax\|min_free' "$SB/systemd/browser.slice" "$SB/93-memory.conf" 2>/dev/null | tr '\n' ' ')"
+fi
+MEM_TMPFS_MIB=10240 mem "$GIB64" memory-slice::apply >/dev/null 2>&1
+if grep -qx 'MemoryMax=48640M' "$SB/systemd/browser.slice" 2>/dev/null; then
+  ok "memory-slice: a tmpfs container store is added to the reserve"
+else
+  fail "memory-slice with a tmpfs store: $(grep MemoryMax "$SB/systemd/browser.slice")"
+fi
+mem "$GIB64" memory-oomd::apply >/dev/null 2>&1
+if grep -qx 'ManagedOOMMemoryPressure=kill' "$SB/systemd/browser.slice.d/50-oomd.conf" 2>/dev/null \
+   && grep -qx 'ManagedOOMMemoryPressureLimit=20%' "$SB/systemd/browser.slice.d/50-oomd.conf" \
+   && grep -qx 'DefaultMemoryPressureDurationSec=20s' "$SB/oomd.conf" 2>/dev/null \
+   && grep -qx systemd-oomd "$SB/pkgs" 2>/dev/null && grep -qx systemd-oomd.service "$SB/enabled" 2>/dev/null \
+   && grep -qx 'restart systemd-oomd.service' "$SB/systemctl"; then
+  ok "memory-oomd: package, slice drop-in, duration, enabled and restarted"
+else
+  fail "memory-oomd: $(cat "$SB/systemd/browser.slice.d/50-oomd.conf" "$SB/oomd.conf" "$SB/systemctl" 2>/dev/null | grep -v '^#' | tr '\n' ' ')"
+fi
+: > "$SB/systemctl"
+mem "$GIB64" memory-oomd::apply >/dev/null 2>&1
+if ! grep -q restart "$SB/systemctl"; then ok "memory-oomd: a re-run does not restart oomd"; else fail "memory-oomd re-run restarted oomd"; fi
+rm -rf "$SB"
+
 echo "== 3f. alt-tailscale-port runs right after the tailnet join =="
 SB="$(mktemp -d)"
 out="$(NODE_SETUP_STATE_DIR="$SB/state" NODE_SETUP_CONF_DIR="$SB/conf" NO_COLOR=1 \

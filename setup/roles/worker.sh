@@ -25,6 +25,9 @@ ROLE_STEPS=(
   k3s-agent-install
   flannel-watchdog
   oom-guards
+  memory-slice
+  memory-protect
+  memory-oomd
   net-limits
   hw-watchdog
   disk-guard
