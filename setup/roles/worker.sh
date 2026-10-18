@@ -27,7 +27,7 @@ ROLE_STEPS=(
   oom-guards
   memory-slice
   memory-protect
-  memory-oomd
+  memory-killer
   net-limits
   hw-watchdog
   disk-guard

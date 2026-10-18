@@ -5,7 +5,7 @@
 #   memory-slice    browser.slice: one cap for every browser container
 #   memory-protect  reserved memory for the daemons that keep the node in the
 #                   cluster, earlier background reclaim
-#   memory-oomd     systemd-oomd ends the session that stalls the slice
+#   memory-killer   ends the biggest browser process once the slice stalls
 # The edge places the browser containers in the slice (Docker cgroup parent).
 # Sizes follow MemTotal when applied; a RAM change fails the check and
 # re-applies.
@@ -24,7 +24,7 @@ _MEM_HIGH_PCT=95
 # "unit MemoryMin MemoryLow" in MiB: about the working set each needs to keep
 # the node in the cluster and reachable. system.slice gets the sums, since a
 # child's protection never exceeds its parent's.
-_MEM_PROTECTED=("k3s-agent 384 768" "containerd 128 256" "docker 128 256" "tailscaled 64 128" "ssh 16 32" "systemd-oomd 64 64")
+_MEM_PROTECTED=("k3s-agent 384 768" "containerd 128 256" "docker 128 256" "tailscaled 64 128" "ssh 16 32" "browser-oom-killer 16 16")
 # Background reclaim starts earlier: min_free_kbytes 1 % of RAM within
 # 64-256 MiB, watermark gaps 1 % of RAM (kernel default 0.1 %).
 _MEM_MIN_FREE_FLOOR_KB=65536
@@ -32,13 +32,17 @@ _MEM_MIN_FREE_CAP_KB=262144
 _MEM_WATERMARK_SCALE=100
 # Without swap, a full slice does not end in an OOM kill: below MemoryMax the
 # browsers evict and re-read their own code and stall (on beta 35 % full
-# pressure for minutes, nothing killed). systemd-oomd then kills the browser
-# container with the most reclaim; a single container at its own limit stays
-# with the kernel, which ends only its biggest process (measured below 2 %).
-_MEM_OOMD_LIMIT="20%"
-_MEM_OOMD_DURATION="20s"
-_MEM_OOMD_DROPIN_NAME="50-oomd.conf"
-_MEM_OOMD_CONF="/etc/systemd/oomd.conf.d/50-node-setup.conf"
+# pressure for minutes, nothing killed). browser-oom-killer then kills the
+# biggest process of the browser container using the most memory, the one the
+# kernel would pick at MemoryMax; a single container at its own limit stays
+# with the kernel (slice pressure measured below 2 %). Not systemd-oomd: on
+# systemd 255 with kernel 6.8 its kill fails on any multi-threaded cgroup
+# (pidfd_open of a thread id is EINVAL), so it goes on to kill every container
+# of the slice, and again a second later, Docker's restarts included.
+_MEM_KILLER_LIMIT_PCT=20
+_MEM_KILLER_HOLD_S=20
+_MEM_KILLER_BIN="/usr/local/sbin/browser-oom-killer"
+_MEM_KILLER_UNIT="browser-oom-killer.service"
 
 _mem_total_kb() { awk '/^MemTotal:/ {print $2}' /proc/meminfo; }
 
@@ -168,43 +172,73 @@ memory-protect::verify() {
     && [[ "$(systemctl show -p MemoryMin --value system.slice)" != "0" ]]
 }
 
-_mem_oomd_slice_dropin() {
-  cat <<EOF2
-# Managed by node-setup (memory-oomd): systemd-oomd kills the browser
-# container with the most reclaim once the slice stalls.
-[Slice]
-ManagedOOMMemoryPressure=kill
-ManagedOOMMemoryPressureLimit=$_MEM_OOMD_LIMIT
+_mem_killer_script() {
+  cat <<'EOF2'
+#!/bin/bash
+# Managed by node-setup (memory-killer): once browser.slice stays at or above
+# <limit> % full memory pressure (avg10) for <hold> s, kills the biggest process
+# of the browser container using the most memory, then waits <hold> s.
+# Usage: browser-oom-killer <limit %> <hold s>
+set -u
+slice=/sys/fs/cgroup/browser.slice
+limit=$1 hold=$2 above=0
+while sleep 1; do
+  read -r _ avg10 _ < <(grep '^full ' "$slice/memory.pressure" 2>/dev/null) || { above=0; continue; }
+  full=${avg10#avg10=}
+  if (( ${full%.*} >= limit )); then above=$((above + 1)); else above=0; fi
+  (( above >= hold )) || continue
+  above=0 scope="" most=0
+  for cg in "$slice"/*.scope; do
+    used=$(cat "$cg/memory.current" 2>/dev/null) || continue
+    if (( used > most )); then most=$used scope=$cg; fi
+  done
+  [[ -n "$scope" ]] || continue
+  pid="" rss=0
+  for p in $(find "$scope" -name cgroup.procs -exec cat {} + 2>/dev/null); do
+    r=$(awk '/^VmRSS:/ {print $2}' "/proc/$p/status" 2>/dev/null)
+    if [[ -n "$r" ]] && (( r > rss )); then pid=$p rss=$r; fi
+  done
+  [[ -n "$pid" ]] || continue
+  comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+  if kill -KILL "$pid" 2>/dev/null; then
+    echo "Killed $comm (pid $pid, $((rss / 1024)) MiB) in ${scope##*/}: browser.slice full memory pressure $full % for $hold s"
+  fi
+  sleep "$hold"
+done
 EOF2
 }
 
-_mem_oomd_conf() {
+_mem_killer_unit() {
   cat <<EOF2
-# Managed by node-setup (memory-oomd): how long the slice must stay above its
-# limit before systemd-oomd acts (systemd 255 has no per-unit setting).
-[OOM]
-DefaultMemoryPressureDurationSec=$_MEM_OOMD_DURATION
+# Managed by node-setup (memory-killer)
+[Unit]
+Description=Ends the biggest browser process when browser.slice stalls on memory
+
+[Service]
+ExecStart=$_MEM_KILLER_BIN $_MEM_KILLER_LIMIT_PCT $_MEM_KILLER_HOLD_S
+Restart=always
+RestartSec=5
+OOMScoreAdjust=-1000
+
+[Install]
+WantedBy=multi-user.target
 EOF2
 }
 
-STEP_DESC["memory-oomd"]="systemd-oomd kills the browser container that stalls browser.slice ($_MEM_OOMD_LIMIT full pressure for $_MEM_OOMD_DURATION)"
-memory-oomd::check() {
-  dpkg -s systemd-oomd >/dev/null 2>&1 \
-    && _mem_file_is "$_MEM_SYSTEMD_DIR/$BROWSER_SLICE.d/$_MEM_OOMD_DROPIN_NAME" _mem_oomd_slice_dropin \
-    && _mem_file_is "$_MEM_OOMD_CONF" _mem_oomd_conf \
-    && systemctl is-active --quiet systemd-oomd.service
+STEP_DESC["memory-killer"]="browser-oom-killer ends the biggest browser process once browser.slice stalls ($_MEM_KILLER_LIMIT_PCT % full pressure for $_MEM_KILLER_HOLD_S s)"
+memory-killer::check() {
+  _mem_file_is "$_MEM_KILLER_BIN" _mem_killer_script \
+    && _mem_file_is "$_MEM_SYSTEMD_DIR/$_MEM_KILLER_UNIT" _mem_killer_unit \
+    && systemctl is-active --quiet "$_MEM_KILLER_UNIT"
 }
-memory-oomd::apply() {
-  ensure_pkgs systemd-oomd
-  _mem_oomd_slice_dropin | write_if_changed "$_MEM_SYSTEMD_DIR/$BROWSER_SLICE.d/$_MEM_OOMD_DROPIN_NAME" || true
-  local rc=0
-  _mem_oomd_conf | write_if_changed "$_MEM_OOMD_CONF" || rc=$?
-  svc_enable_now systemd-oomd.service
-  # oomd reads its configuration only at start
-  [[ "$rc" -eq 0 ]] && systemctl restart systemd-oomd.service
+memory-killer::apply() {
+  local changed=1
+  _mem_killer_script | write_if_changed "$_MEM_KILLER_BIN" 0755 && changed=0
+  _mem_killer_unit | write_if_changed "$_MEM_SYSTEMD_DIR/$_MEM_KILLER_UNIT" && changed=0
+  svc_enable_now "$_MEM_KILLER_UNIT"
+  [[ "$changed" -eq 0 ]] && systemctl restart "$_MEM_KILLER_UNIT"
   return 0
 }
-memory-oomd::verify() {
-  systemctl is-active --quiet systemd-oomd.service \
-    && [[ "$(systemctl show -p ManagedOOMMemoryPressure --value "$BROWSER_SLICE")" == "kill" ]]
+memory-killer::verify() {
+  systemctl is-active --quiet "$_MEM_KILLER_UNIT"
 }

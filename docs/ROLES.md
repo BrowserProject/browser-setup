@@ -24,7 +24,7 @@ docker-install docker-daemon-config
 ufw-rules session-isolation
 profile-legacy-cleanup
 k3s-agent-install
-flannel-watchdog oom-guards memory-slice memory-protect memory-oomd
+flannel-watchdog oom-guards memory-slice memory-protect memory-killer
 net-limits hw-watchdog disk-guard
 [exitnode-routing]          # when EXITNODE_ROUTING=1 in cluster.env
 ```
@@ -53,7 +53,7 @@ never starts on a node without its share:
 profile-share-kernel profile-share-scratch [profile-share-export] profile-share-mount profile-share-units
 ```
 
-### Memory protection (`memory-slice`, `memory-protect`, `memory-oomd`)
+### Memory protection (`memory-slice`, `memory-protect`, `memory-killer`)
 
 A worker has no swap. When its browser sessions use up the RAM, the kernel
 evicts the program code of k3s, containerd, tailscaled and sshd and reads it
@@ -64,8 +64,8 @@ browsers inside one bound and the node outside it:
 | Step | What it sets |
 |------|--------------|
 | `memory-slice` | `/etc/systemd/system/browser.slice`: `MemoryMax` = RAM - max(2.5 GiB, 8 % of RAM), minus a tmpfs container store (`deadssd`) rounded up to whole GiB plus one; `MemoryHigh` 95 % of that. Sized from `MemTotal` when applied; a RAM change re-applies |
-| `memory-protect` | `MemoryMin`/`MemoryLow` drop-ins `90-memory.conf` (MiB): k3s-agent 384/768, containerd 128/256, docker 128/256, tailscaled 64/128, ssh 16/32, systemd-oomd 64/64; `system.slice` gets the sums (784/1504), since a child is never protected beyond its parent. `/etc/sysctl.d/93-node-setup-memory.conf`: `vm.min_free_kbytes` 1 % of RAM within 64-256 MiB, `vm.watermark_scale_factor` 100 |
-| `memory-oomd` | `systemd-oomd`, `browser.slice.d/50-oomd.conf` `ManagedOOMMemoryPressure=kill` at 20 % full pressure, `/etc/systemd/oomd.conf.d/50-node-setup.conf` `DefaultMemoryPressureDurationSec=20s` |
+| `memory-protect` | `MemoryMin`/`MemoryLow` drop-ins `90-memory.conf` (MiB): k3s-agent 384/768, containerd 128/256, docker 128/256, tailscaled 64/128, ssh 16/32, browser-oom-killer 16/16; `system.slice` gets the sums (736/1456), since a child is never protected beyond its parent. `/etc/sysctl.d/93-node-setup-memory.conf`: `vm.min_free_kbytes` 1 % of RAM within 64-256 MiB, `vm.watermark_scale_factor` 100 |
+| `memory-killer` | `/usr/local/sbin/browser-oom-killer` run by `browser-oom-killer.service` (`OOMScoreAdjust=-1000`): once `browser.slice` stays at or above 20 % full memory pressure (avg10) for 20 s, it kills the biggest process (`VmRSS`) of the container using the most memory, logs `Killed <comm> (pid, MiB) in docker-<id>.scope`, and waits 20 s |
 
 The slice only bounds what runs in it: the platform's edge starts every
 browser container with Docker's cgroup parent `browser.slice`. A container
@@ -89,26 +89,37 @@ one growing 100 MiB/s, all in the slice):
   evict and re-read their own code, 35 % full pressure, sessions answering every
   4 s, nothing killed in 4 minutes. Without `MemoryHigh` the kernel killed
   after about 2 minutes of the same.
-- systemd-oomd ended it 40 s after the slice filled, killing exactly the
-  growing container; earlyoom (prefer/avoid lists, `-m 10`) never fired,
-  because the node's free memory stays healthy while the slice stalls. A
-  single container at its own limit stays with the kernel, which kills only
-  its biggest process (slice pressure under 2 %, no oomd kill).
-- What follows an oomd kill is the container's restart policy: Docker
-  restarts a regular session's container (`unless-stopped`), so the session
-  goes on with a fresh browser; a saved-profile container (`no`) stays down.
+- earlyoom (prefer/avoid lists, `-m 10`) never fired, because the node's free
+  memory stays healthy while the slice stalls. A single container at its own
+  limit stays with the kernel, which kills only its biggest process (slice
+  pressure under 2 %).
+- systemd-oomd cannot be the killer on Ubuntu 24.04: systemd 255 lists a
+  cgroup's threads through `pidfd_open`, which kernel 6.8 refuses for a
+  thread id (EINVAL), so its kill of any multi-threaded container reports a
+  failure after the SIGKILL went out. oomd then moves on to the next candidate,
+  killing every container of the slice, and with no pause after a "failed"
+  kill it repeated a second later and killed Docker's restarts too: four real
+  Chrome sessions, all ended. Its earlier single-threaded stand-ins hid this.
+- browser-oom-killer with real Chrome (one enhanced session allocating 3.8 GiB
+  in a tab beside three standard sessions, all streaming): it killed only the
+  3.4 GiB renderer 27 s after the slice filled, every container kept running
+  without a restart, the tab crashed and the session went on; `system.slice`
+  stayed under 1 % full pressure and SSH answered every probe. While the slice
+  stalled, the other sessions' streams froze for about 20 s, and their viewers
+  fell back to WebSockets until it ended.
 - No zram: with the slice bound the node itself never needed swap, and swap
   would need `fail-swap-on=false` on the kubelet.
 
 Rollback on a node. A later `node-setup` run applies the steps again while the
-worker role lists them, so pass `--skip memory-slice,memory-protect,memory-oomd`
+worker role lists them, so pass `--skip memory-slice,memory-protect,memory-killer`
 until they are removed from it:
 
 ```bash
-systemctl disable --now systemd-oomd.service systemd-oomd.socket
-rm -f /etc/systemd/system/browser.slice /etc/systemd/system/browser.slice.d/50-oomd.conf \
-  /etc/systemd/system/{k3s-agent,containerd,docker,tailscaled,ssh,systemd-oomd}.service.d/90-memory.conf \
-  /etc/systemd/system/system.slice.d/90-memory.conf /etc/systemd/oomd.conf.d/50-node-setup.conf \
+systemctl disable --now browser-oom-killer.service
+rm -f /etc/systemd/system/browser.slice /etc/systemd/system/browser-oom-killer.service \
+  /usr/local/sbin/browser-oom-killer \
+  /etc/systemd/system/{k3s-agent,containerd,docker,tailscaled,ssh,browser-oom-killer}.service.d/90-memory.conf \
+  /etc/systemd/system/system.slice.d/90-memory.conf \
   /etc/sysctl.d/93-node-setup-memory.conf
 systemctl daemon-reload            # running containers keep their slice, now unbounded
 sysctl -w vm.watermark_scale_factor=10  # min_free_kbytes returns to the kernel default at the next boot

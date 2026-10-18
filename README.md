@@ -85,7 +85,7 @@ node-setup --dry-run     # print the plan without changing anything
 
 | Role | What it becomes | Notable steps |
 |------|-----------------|---------------|
-| `worker` | k3s agent running browser workspaces via Docker | tailscale, docker, k3s-agent, ufw (80/443), flannel-watchdog, oom-guards, memory protection (browser.slice, systemd-oomd), exit-node routing |
+| `worker` | k3s agent running browser workspaces via Docker | tailscale, docker, k3s-agent, ufw (80/443), flannel-watchdog, oom-guards, memory protection (browser.slice, browser-oom-killer), exit-node routing |
 | `gateway` | public-facing k3s agent | as worker, public 80/443 |
 | `control-plane` | k3s server (single-node sqlite datastore) + services | k3s-server, registry secret, applies the services manifest (`--manifests`) |
 | `db` | PostgreSQL host | postgres (databases + roles + pg_hba), ufw |
@@ -172,10 +172,10 @@ Nothing about this repo is burst-specific. See
 - **oom-guards / hw-watchdog / disk-guard.** Keep a node up under memory
   pressure, hardware faults, and dying disks (`deadssd` module for tmpfs
   mitigation).
-- **memory-slice / memory-protect / memory-oomd.** All browser containers share
+- **memory-slice / memory-protect / memory-killer.** All browser containers share
   one memory bound below the node's RAM, the node's daemons keep theirs, and
-  systemd-oomd ends the session that stalls the bound, so sessions using up
-  the RAM no longer freeze the node ([docs/ROLES.md](docs/ROLES.md#memory-protection-memory-slice-memory-protect-memory-oomd)).
+  browser-oom-killer ends the browser process that stalls the bound, so sessions
+  using up the RAM no longer freeze the node ([docs/ROLES.md](docs/ROLES.md#memory-protection-memory-slice-memory-protect-memory-killer)).
 
 ## Tests
 

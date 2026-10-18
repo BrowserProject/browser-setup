@@ -271,7 +271,7 @@ mem() {
     source "$INFRA/setup/lib/framework.sh"
     source "$INFRA/setup/modules/memory.sh"
     STATE_DIR="$SB" MEM_TOTAL_KB="$1" MEM_TMPFS_MIB="${MEM_TMPFS_MIB:-0}"
-    _MEM_SYSTEMD_DIR="$SB/systemd" _MEM_SYSCTL_FILE="$SB/93-memory.conf" _MEM_OOMD_CONF="$SB/oomd.conf"
+    _MEM_SYSTEMD_DIR="$SB/systemd" _MEM_SYSCTL_FILE="$SB/93-memory.conf" _MEM_KILLER_BIN="$SB/browser-oom-killer"
     _mem_total_kb() { echo "$MEM_TOTAL_KB"; }
     _mem_tmpfs_store_mib() { echo "$MEM_TMPFS_MIB"; }
     ensure_pkgs() { echo "$*" >> "$SB/pkgs"; }
@@ -303,8 +303,8 @@ else
 fi
 if grep -qx 'MemoryMin=384M' "$SB/systemd/k3s-agent.service.d/90-memory.conf" 2>/dev/null \
    && grep -qx 'MemoryLow=32M' "$SB/systemd/ssh.service.d/90-memory.conf" 2>/dev/null \
-   && grep -qx 'MemoryMin=784M' "$SB/systemd/system.slice.d/90-memory.conf" 2>/dev/null \
-   && grep -qx 'MemoryLow=1504M' "$SB/systemd/system.slice.d/90-memory.conf" 2>/dev/null \
+   && grep -qx 'MemoryMin=736M' "$SB/systemd/system.slice.d/90-memory.conf" 2>/dev/null \
+   && grep -qx 'MemoryLow=1456M' "$SB/systemd/system.slice.d/90-memory.conf" 2>/dev/null \
    && grep -qx 'vm.min_free_kbytes = 81315' "$SB/93-memory.conf" 2>/dev/null \
    && grep -qx 'vm.watermark_scale_factor = 100' "$SB/93-memory.conf" 2>/dev/null; then
   ok "memory-protect: service drop-ins, system.slice sums, reclaim sysctls"
@@ -335,19 +335,24 @@ if grep -qx 'MemoryMax=48640M' "$SB/systemd/browser.slice" 2>/dev/null; then
 else
   fail "memory-slice with a tmpfs store: $(grep MemoryMax "$SB/systemd/browser.slice")"
 fi
-mem "$GIB64" memory-oomd::apply >/dev/null 2>&1
-if grep -qx 'ManagedOOMMemoryPressure=kill' "$SB/systemd/browser.slice.d/50-oomd.conf" 2>/dev/null \
-   && grep -qx 'ManagedOOMMemoryPressureLimit=20%' "$SB/systemd/browser.slice.d/50-oomd.conf" \
-   && grep -qx 'DefaultMemoryPressureDurationSec=20s' "$SB/oomd.conf" 2>/dev/null \
-   && grep -qx systemd-oomd "$SB/pkgs" 2>/dev/null && grep -qx systemd-oomd.service "$SB/enabled" 2>/dev/null \
-   && grep -qx 'restart systemd-oomd.service' "$SB/systemctl"; then
-  ok "memory-oomd: package, slice drop-in, duration, enabled and restarted"
+mem "$GIB64" memory-killer::apply >/dev/null 2>&1
+if [[ -x "$SB/browser-oom-killer" ]] && bash -n "$SB/browser-oom-killer" \
+   && grep -qx "ExecStart=$SB/browser-oom-killer 20 20" "$SB/systemd/browser-oom-killer.service" 2>/dev/null \
+   && grep -qx 'OOMScoreAdjust=-1000' "$SB/systemd/browser-oom-killer.service" \
+   && grep -qx browser-oom-killer.service "$SB/enabled" 2>/dev/null \
+   && grep -qx 'restart browser-oom-killer.service' "$SB/systemctl"; then
+  ok "memory-killer: script, unit at 20 % for 20 s, enabled and restarted"
 else
-  fail "memory-oomd: $(cat "$SB/systemd/browser.slice.d/50-oomd.conf" "$SB/oomd.conf" "$SB/systemctl" 2>/dev/null | grep -v '^#' | tr '\n' ' ')"
+  fail "memory-killer: $(grep -v '^#' "$SB/systemd/browser-oom-killer.service" "$SB/systemctl" 2>/dev/null | tr '\n' ' ')"
+fi
+if grep -qx 'MemoryMin=16M' "$SB/systemd/browser-oom-killer.service.d/90-memory.conf" 2>/dev/null; then
+  ok "memory-protect: the killer keeps its memory"
+else
+  fail "memory-protect: no drop-in for browser-oom-killer"
 fi
 : > "$SB/systemctl"
-mem "$GIB64" memory-oomd::apply >/dev/null 2>&1
-if ! grep -q restart "$SB/systemctl"; then ok "memory-oomd: a re-run does not restart oomd"; else fail "memory-oomd re-run restarted oomd"; fi
+mem "$GIB64" memory-killer::apply >/dev/null 2>&1
+if ! grep -q restart "$SB/systemctl"; then ok "memory-killer: a re-run does not restart it"; else fail "memory-killer re-run restarted it"; fi
 rm -rf "$SB"
 
 echo "== 3f. alt-tailscale-port runs right after the tailnet join =="
