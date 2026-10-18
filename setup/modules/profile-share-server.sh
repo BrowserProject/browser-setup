@@ -22,6 +22,27 @@ _ps_nfsd_dropin() {
 _ps_exports_line() {
   echo "$PROFILE_SHARE_SERVER_DIR 127.0.0.1(rw,sync,no_subtree_check,no_root_squash,sec=sys)"
 }
+# An ext4 error turns the share read-only instead of being recorded and
+# written past (the mkfs default, continue). Set in the superblock for every
+# later mount and live through a remount, neither needs an unmount.
+_ps_loop_of() { # mount point -> its loop device
+  local loop
+  loop="$(_ps_mountinfo "$1" | cut -d' ' -f2)"
+  [[ "$loop" == /dev/loop* ]] && echo "$loop"
+}
+_ps_errors_ro_ok() { # mount point
+  local loop
+  loop="$(_ps_loop_of "$1")" || return 1
+  [[ "$(dumpe2fs -h "$loop" 2>/dev/null | sed -n 's/^Errors behavior: *//p')" == "Remount read-only" ]] \
+    && grep -qx errors=remount-ro "/proc/fs/ext4/${loop#/dev/}/options"
+}
+_ps_errors_ro() { # mount point
+  local loop
+  loop="$(_ps_loop_of "$1")" || die "$1 is not mounted from a loop device"
+  # through the loop device, whose cache holds the mounted superblock, never the image file
+  tune2fs -e remount-ro "$loop" >/dev/null
+  grep -qx errors=remount-ro "/proc/fs/ext4/${loop#/dev/}/options" || mount -o remount,errors=remount-ro "$1"
+}
 # shellcheck disable=SC2153 # PROFILE_SHARE_SERVER_GIB is set by profile_share_configure
 _ps_export_ok() {
   local exported listeners
@@ -30,6 +51,7 @@ _ps_export_ok() {
     && cmp -s <(_ps_nfsd_conf) /etc/nfs.conf.d/browser-profile-share.conf \
     && cmp -s <(_ps_nfsd_dropin) /etc/systemd/system/nfs-server.service.d/browser.conf \
     && _ps_image_ok "$PROFILE_SHARE_SERVER_IMG" "$PROFILE_SHARE_SERVER_GIB" "$PROFILE_SHARE_SERVER_DIR" \
+    && _ps_errors_ro_ok "$PROFILE_SHARE_SERVER_DIR" \
     && systemctl is-active --quiet nfs-server \
     && [[ "$(nfsconf --get nfsd lease-time)" == 90 ]] \
     && [[ "$(cat /proc/fs/nfsd/nfsv4leasetime 2>/dev/null)" == 90 ]] \
@@ -56,6 +78,7 @@ profile-share-export::apply() {
   [[ -n "$(_ps_mountinfo "$PROFILE_SHARE_SERVER_DIR")" ]] || mount "$PROFILE_SHARE_SERVER_DIR"
   _ps_image_ok "$PROFILE_SHARE_SERVER_IMG" "$PROFILE_SHARE_SERVER_GIB" "$PROFILE_SHARE_SERVER_DIR" \
     || die "$PROFILE_SHARE_SERVER_DIR is mounted from something other than $PROFILE_SHARE_SERVER_IMG; unmount it first"
+  _ps_errors_ro "$PROFILE_SHARE_SERVER_DIR"
   chmod 0711 "$PROFILE_SHARE_SERVER_DIR"
   _ps_nfsd_dropin | write_if_changed /etc/systemd/system/nfs-server.service.d/browser.conf && restart=1
   _ps_exports_line | replace_block /etc/exports "node-setup profile-share-export" || true

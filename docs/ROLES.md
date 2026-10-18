@@ -22,10 +22,20 @@ swap-disable session-limits
 tailscale-install tailscale-up
 docker-install docker-daemon-config
 ufw-rules session-isolation
+profile-legacy-cleanup
 k3s-agent-install
 flannel-watchdog oom-guards net-limits hw-watchdog disk-guard
 [exitnode-routing]          # when EXITNODE_ROUTING=1 in cluster.env
 ```
+
+`profile-legacy-cleanup` removes what the retired saved-profile engine left on a
+worker (`browser-profile-root.service`, `/opt/browser-infra/profile-storage`,
+`/etc/browser-profile-storage.env` and its `.bak-*` copies, the mount and fstab
+line of `/var/lib/browser-profiles`, an empty `/var/lib/browser-profiles` and
+an empty `/var/lib/browser-profile-scratch/.migrate`). It deletes no data: a
+non-empty root or `.migrate`, `/var/lib/browser-profiles.img` and mounts below
+the root are logged and left, and its check keeps failing in `doctor` until a
+human clears them.
 
 Optional modules: `deadssd` (tmpfs mitigation for a dying disk), `direct-egress` (worker
 sessions leave through the node's own address: replaces `exitnode-routing`,
@@ -63,7 +73,7 @@ mirrored from infra/profile-share/README.md#contract. Keep in sync.
 | Layout | `images/<id>.img` (0700 dir), `probe/` (0700) |
 | Kernel | `/etc/modprobe.d/browser-profiles.conf` `options nfs recover_lost_locks=0 nfs4_unique_id=<machine-id>`, verified live in `/sys/module/nfs/parameters/`; `/etc/modules-load.d/browser-profiles.conf` `loop`, `nfs`; `kernel.hung_task_panic=0`; `/run` propagation `shared`; kernel >= 5.8; tmpfiles `/run/browser-profiles/{profile,selftest}` 0700 |
 | Scratch | `/var/lib/browser-profile-scratch.img`, `PROFILE_SCRATCH_GIB`, fully allocated, `mkfs.ext4 -F -q -m 0 -L brl-scratch -E nodiscard,lazy_itable_init=0,lazy_journal_init=0`; fstab `/var/lib/browser-profile-scratch.img /var/lib/browser-profile-scratch ext4 loop,nosuid,nodev,noatime,nofail,X-fstrim.notrim,x-systemd.before=docker.service 0 2`; root 0700. Node-wide bound for browser caches |
-| Server (beta) | `/var/lib/browser-profile-share.img`, `PROFILE_SHARE_SERVER_GIB`, fully allocated, label `brl-share`, fstab `... /srv/browser-profile-share ext4 loop,nosuid,nodev,noatime,nofail,X-fstrim.notrim 0 2`; export `/srv/browser-profile-share 127.0.0.1(rw,sync,no_subtree_check,no_root_squash,sec=sys)`; `[nfsd] host=127.0.0.1 vers3=n vers4.0=n vers4.1=y vers4.2=y lease-time=90 grace-time=90`. Requires `PROFILE_SHARE_EXPORT=127.0.0.1:/srv/browser-profile-share` |
+| Server (beta) | `/var/lib/browser-profile-share.img`, `PROFILE_SHARE_SERVER_GIB`, fully allocated, label `brl-share`, errors behaviour `remount-ro` (`tune2fs -e` on its loop device, applied live with a remount), fstab `... /srv/browser-profile-share ext4 loop,nosuid,nodev,noatime,nofail,X-fstrim.notrim 0 2`; export `/srv/browser-profile-share 127.0.0.1(rw,sync,no_subtree_check,no_root_squash,sec=sys)`; `[nfsd] host=127.0.0.1 vers3=n vers4.0=n vers4.1=y vers4.2=y lease-time=90 grace-time=90`. Requires `PROFILE_SHARE_EXPORT=127.0.0.1:/srv/browser-profile-share` |
 | Disk gate | `df -B1G --output=avail /var/lib` >= the images still to create + 20 GiB, before any image is created (a dry run only warns). Images are fixed: a size change is refused, resizing is manual |
 | Units | `browser-profile-share-mount.timer` (30 s after boot, then every 60 s) mounts a missing share; `browser-profiles-detach.service` drains every saved-profile browser (`drain-profile`, at most 85 s, in parallel), stops the profile containers, unmounts every profile and frees its loop at shutdown, before the share goes (`TimeoutStopSec=240`) |
 

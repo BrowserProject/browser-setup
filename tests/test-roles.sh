@@ -286,7 +286,7 @@ ns() { # ns <args...>: node-setup in a fresh sandbox, output on stdout, its rc
 }
 plan_of() { ns steps --role worker --modules "$1" | awk '{print $1}' | tr '\n' ' '; }
 plan="$(plan_of direct-egress,profile-share)"
-if [[ "$plan" == *"session-isolation profile-share-kernel profile-share-scratch profile-share-mount profile-share-units k3s-agent-install "* \
+if [[ "$plan" == *"session-isolation profile-legacy-cleanup profile-share-kernel profile-share-scratch profile-share-mount profile-share-units k3s-agent-install "* \
       && "$plan" == *" direct-egress " && "$plan" != *exitnode-routing* ]]; then
   ok "profile-share steps run before the agent joins; direct-egress stays last"
 else
@@ -410,6 +410,89 @@ fi
 rm -rf "$SB"
 unset PROFILE_SHARE_EXPORT PROFILE_SHARE_DOMAIN
 
+echo "== 3g2. profile-legacy-cleanup =="
+SB="$(mktemp -d)"
+plan="$(ns steps --role worker | awk '{print $1}' | tr '\n' ' ')"
+if [[ "$plan" == *"session-isolation profile-legacy-cleanup k3s-agent-install "* ]]; then
+  ok "every worker runs profile-legacy-cleanup"
+else
+  fail "profile-legacy-cleanup missing from the worker plan: $plan"
+fi
+# legacy <step fn>: runs it as the framework does, with the paths in the
+# sandbox, mounts from $SB/mounts and systemctl/umount recorded in $SB/calls
+# shellcheck disable=SC1091
+legacy() {
+  (
+    export NODE_SETUP_STATE_DIR="$SB/state"
+    source "$INFRA/setup/lib/framework.sh"
+    source "$INFRA/setup/modules/profile-legacy.sh"
+    PROFILE_LEGACY_UNIT_DIR="$SB/systemd" PROFILE_LEGACY_ROOT="$SB/profiles" PROFILE_LEGACY_IMG="$SB/profiles.img"
+    PROFILE_LEGACY_INFRA="$SB/opt" PROFILE_LEGACY_ENV="$SB/storage.env" PROFILE_LEGACY_MIGRATE="$SB/scratch/.migrate"
+    PROFILE_LEGACY_FSTAB="$SB/fstab"
+    _pl_mounts() { cat "$SB/mounts" 2>/dev/null; }
+    systemctl() {
+      echo "systemctl $*" >> "$SB/calls"
+      case "$1" in
+        is-active) [[ -f "$SB/active" ]] ;;
+        stop) rm -f "$SB/active" ;;
+      esac
+    }
+    umount() { echo "umount $*" >> "$SB/calls"; sed -i '$d' "$SB/mounts"; }
+    _run_fn "$1"
+  ) > "$SB/out" 2>&1
+}
+legacy_node() { # the leftovers seen on beta: unit enabled, bundle, env + backup, stacked mounts, fstab line
+  rm -rf "${SB:?}"/{systemd,profiles,opt,scratch,storage.env*,fstab,mounts,calls,active,profiles.img}
+  mkdir -p "$SB/systemd/multi-user.target.wants" "$SB/profiles" "$SB/opt/profile-storage/scripts" "$SB/scratch/.migrate"
+  echo '[Unit]' > "$SB/systemd/browser-profile-root.service"
+  ln -s ../browser-profile-root.service "$SB/systemd/multi-user.target.wants/browser-profile-root.service"
+  touch "$SB/active" "$SB/opt/profile-storage/scripts/node-setup.sh"
+  echo 'PROFILE_S3_BUCKET=x' > "$SB/storage.env"
+  cp "$SB/storage.env" "$SB/storage.env.bak-20261001"
+  printf '%s\n' '# /etc/fstab' 'UUID=1 / ext4 defaults 0 1' "$SB/profiles.img $SB/profiles xfs loop,prjquota,nofail 0 0" \
+    "#$SB/profiles.img $SB/profiles xfs loop 0 0" > "$SB/fstab"
+  printf '%s\n' "$SB/profiles" "$SB/profiles" > "$SB/mounts"
+}
+legacy_node
+if ! legacy profile-legacy-cleanup::check; then ok "legacy: leftovers fail the check (doctor reports them)"; else fail "legacy: check passed with leftovers"; fi
+if legacy profile-legacy-cleanup::apply && legacy profile-legacy-cleanup::verify && legacy profile-legacy-cleanup::check \
+   && [[ -z "$(ls -A "$SB/systemd/multi-user.target.wants")" && ! -e "$SB/systemd/browser-profile-root.service" ]] \
+   && [[ ! -e "$SB/profiles" && ! -e "$SB/opt" && ! -e "$SB/scratch/.migrate" && -z "$(compgen -G "$SB/storage.env*")" ]] \
+   && [[ "$(cat "$SB/fstab")" == "$(printf '%s\n' '# /etc/fstab' 'UUID=1 / ext4 defaults 0 1' "#$SB/profiles.img $SB/profiles xfs loop 0 0")" ]] \
+   && [[ ! -s "$SB/mounts" && "$(grep -c '^umount' "$SB/calls")" == 2 ]] \
+   && grep -qx 'systemctl stop browser-profile-root.service' "$SB/calls"; then
+  ok "legacy: unit stopped and removed, both mounts, fstab line, empty root, bundle, env files and .migrate gone"
+else
+  fail "legacy: cleanup incomplete: $(cat "$SB/out")"; ls -AR "$SB" | head -30
+fi
+rm -f "$SB/calls"
+if legacy profile-legacy-cleanup::apply && ! grep -v "^systemctl is-active" "$SB/calls"; then
+  ok "legacy: a re-run on a clean node changes nothing"
+else
+  fail "legacy: re-run: $(cat "$SB/calls" 2>/dev/null)"
+fi
+# data and foreign content stay: a non-empty root, the image, a non-empty
+# .migrate, other content in /opt/browser-infra, a mount below the root
+legacy_node
+touch "$SB/profiles/keep" "$SB/scratch/.migrate/keep" "$SB/profiles.img" "$SB/opt/other"
+echo "$SB/profiles/profiles/x/merged" >> "$SB/mounts"
+if legacy profile-legacy-cleanup::apply && legacy profile-legacy-cleanup::verify && ! legacy profile-legacy-cleanup::check \
+   && [[ -f "$SB/profiles/keep" && -f "$SB/scratch/.migrate/keep" && -f "$SB/profiles.img" && -f "$SB/opt/other" ]] \
+   && [[ ! -e "$SB/opt/profile-storage" && ! -e "$SB/storage.env" ]] && ! grep -q '^umount' "$SB/calls"; then
+  ok "legacy: data, foreign content and nested mounts stay; check keeps reporting them"
+else
+  fail "legacy: data case: $(cat "$SB/out")"
+fi
+: > "$SB/mounts"
+legacy profile-legacy-cleanup::apply
+if grep -q "$SB/profiles is not empty; left in place" "$SB/out" && grep -q "$SB/profiles.img still exists" "$SB/out" \
+   && grep -q "$SB/scratch/.migrate is not empty" "$SB/out"; then
+  ok "legacy: apply names what it leaves"
+else
+  fail "legacy: warnings: $(cat "$SB/out")"
+fi
+rm -rf "$SB"
+
 echo "== 3h. profile-share images and mount points (root + loop devices) =="
 if [[ "$(id -u)" == 0 ]] && losetup -f >/dev/null 2>&1 && command -v mkfs.ext4 >/dev/null; then
   SB="$(mktemp -d)"
@@ -418,6 +501,7 @@ if [[ "$(id -u)" == 0 ]] && losetup -f >/dev/null 2>&1 && command -v mkfs.ext4 >
       export NODE_SETUP_STATE_DIR="$SB/state"
       source "$INFRA/setup/lib/framework.sh"
       source "$INFRA/setup/modules/profile-share.sh"
+      source "$INFRA/setup/modules/profile-share-server.sh"
       PROFILE_SHARE_GIB_BYTES=16777216 PROFILE_SCRATCH_IMG="$SB/scratch.img" PROFILE_SCRATCH_GIB=4
       df() { printf 'Avail\n999\n'; }
       _run_fn "$*"
@@ -456,7 +540,18 @@ if [[ "$(id -u)" == 0 ]] && losetup -f >/dev/null 2>&1 && command -v mkfs.ext4 >
     fail "image check on the mounted image"
   fi
   if img_helpers _ps_image_ok "$SB/scratch.img" 5 "$SB/mnt"; then fail "image check accepted a wrong size"; else ok "image check refuses a wrong size"; fi
+  if ! img_helpers _ps_errors_ro_ok "$SB/mnt" && img_helpers _ps_errors_ro "$SB/mnt" && img_helpers _ps_errors_ro_ok "$SB/mnt" \
+     && img_helpers _ps_errors_ro "$SB/mnt"; then
+    ok "errors behaviour: continue -> remount-ro in the superblock and live, without an unmount; a re-run is a no-op"
+  else
+    fail "errors behaviour remount-ro"
+  fi
   umount "$SB/mnt"
+  if [[ "$(dumpe2fs -h "$SB/scratch.img" 2>/dev/null | sed -n 's/^Errors behavior: *//p')" == "Remount read-only" ]]; then
+    ok "errors behaviour: the superblock keeps remount-ro after the unmount"
+  else
+    fail "errors behaviour lost at unmount"
+  fi
   chattr -i "$SB/mnt"
   mkdir -p "$SB/full" && touch "$SB/full/x"
   if img_helpers _ps_mount_point "$SB/full"; then fail "mount point: a non-empty directory should be refused"; else ok "mount point: a non-empty unmounted directory is refused"; fi
