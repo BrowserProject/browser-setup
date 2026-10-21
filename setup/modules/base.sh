@@ -23,7 +23,10 @@ base-packages::verify() {
 
 STEP_DESC["base-time"]="enable NTP time sync (TLS and cluster auth need correct clocks)"
 base-time::check() {
-  timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -qx yes
+  # A clock synced by another daemon (chrony on the OVH 26.04 image) is not
+  # this step: verify needs timesyncd, and installing it replaces chrony.
+  systemctl is-active --quiet systemd-timesyncd \
+    && timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -qx yes
 }
 base-time::apply() {
   ensure_pkgs systemd-timesyncd
