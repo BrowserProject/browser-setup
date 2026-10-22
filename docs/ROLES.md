@@ -17,7 +17,7 @@ are opted in with `--modules a,b`.
 k3s agent that runs browser workspaces via Docker.
 
 ```
-base-packages base-time base-journald base-unattended base-ssh-harden
+base-packages base-time base-journald base-unattended base-ssh-harden base-services
 swap-disable session-limits
 tailscale-install tailscale-up
 docker-install docker-daemon-config

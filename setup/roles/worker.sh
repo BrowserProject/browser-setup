@@ -13,6 +13,7 @@ ROLE_STEPS=(
   base-journald
   base-unattended
   base-ssh-harden
+  base-services
   swap-disable
   session-limits
   tailscale-install

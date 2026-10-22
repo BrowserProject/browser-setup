@@ -153,6 +153,42 @@ base-ssh-harden::verify() {
   sshd -t 2>/dev/null && _ssh_harden_effective
 }
 
+# Stock Ubuntu desktop/hardware services a headless cluster node never uses:
+# modem, removable disks, power, firmware updates, multipath and iSCSI (no SAN),
+# VMware tools, thermald, crash reporting, snapd and lxd (no snaps), atd.
+BASE_UNNEEDED_UNITS=(
+  ModemManager.service udisks2.service upower.service
+  fwupd.service fwupd-refresh.timer
+  multipathd.service multipathd.socket
+  iscsid.socket iscsid.service open-iscsi.service
+  open-vm-tools.service vgauth.service thermald.service
+  apport.service motd-news.timer atd.service
+  snapd.service snapd.socket snapd.seeded.service snapd.apparmor.service lxd-installer.socket
+)
+
+STEP_DESC["base-services"]="mask stock services a headless cluster node never needs"
+base-services::check() {
+  local unit state
+  for unit in "${BASE_UNNEEDED_UNITS[@]}"; do
+    state="$(systemctl show -p LoadState --value "$unit" 2>/dev/null)"
+    [[ "$state" == masked || "$state" == not-found ]] || return 1
+  done
+}
+base-services::apply() {
+  local unit present=()
+  for unit in "${BASE_UNNEEDED_UNITS[@]}"; do
+    if [[ "$(systemctl show -p LoadState --value "$unit" 2>/dev/null)" == loaded ]]; then
+      present+=("$unit")
+    fi
+  done
+  [[ ${#present[@]} -gt 0 ]] || return 0
+  systemctl mask --now "${present[@]}"
+  systemctl reset-failed "${present[@]}" 2>/dev/null || true
+}
+base-services::verify() {
+  base-services::check
+}
+
 STEP_DESC["swap-disable"]="disable swap (kubelet requirement on cluster nodes)"
 swap-disable::check() {
   [[ -z "$(swapon --noheadings --show 2>/dev/null)" ]] && ! grep -qE '^[^#].*\sswap\s' /etc/fstab
