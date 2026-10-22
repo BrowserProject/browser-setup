@@ -93,8 +93,20 @@ base-unattended::verify() {
 }
 
 STEP_DESC["base-ssh-harden"]="disable SSH password auth (only when key auth is proven present)"
+# sshd keeps the first value it reads and includes sshd_config.d/*.conf in lexical
+# order, so the drop-in sorts first: 50-cloud-init.conf sets PasswordAuthentication
+# yes on many provider images and would win over any later file.
+_ssh_harden_effective() {
+  # /run/sshd is absent on a fresh image until sshd first starts; sshd -t/-T need it.
+  mkdir -p /run/sshd
+  local eff
+  eff="$(sshd -T 2>/dev/null)" || return 1
+  grep -qx 'passwordauthentication no' <<<"$eff" &&
+    grep -qx 'kbdinteractiveauthentication no' <<<"$eff"
+}
 base-ssh-harden::check() {
-  [[ -f /etc/ssh/sshd_config.d/90-node-setup.conf ]]
+  [[ -f /etc/ssh/sshd_config.d/00-node-setup.conf && ! -e /etc/ssh/sshd_config.d/90-node-setup.conf ]] &&
+    _ssh_harden_effective
 }
 base-ssh-harden::apply() {
   # Lockout guard: never disable password auth unless a root authorized_key
@@ -104,7 +116,8 @@ base-ssh-harden::apply() {
     warn "no key in /root/.ssh/authorized_keys; leaving SSH password auth untouched"
     return 0
   fi
-  write_if_changed /etc/ssh/sshd_config.d/90-node-setup.conf <<'EOF' || return 0
+  rm -f /etc/ssh/sshd_config.d/90-node-setup.conf
+  write_if_changed /etc/ssh/sshd_config.d/00-node-setup.conf <<'EOF' || true
 # Managed by node-setup: key-only SSH.
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -119,7 +132,7 @@ EOF
   mkdir -p /run/sshd
   local sshd_err
   if ! sshd_err="$(sshd -t 2>&1)"; then
-    rm -f /etc/ssh/sshd_config.d/90-node-setup.conf
+    rm -f /etc/ssh/sshd_config.d/00-node-setup.conf
     die "sshd -t rejected the hardening drop-in; removed it (sshd untouched): ${sshd_err}"
   fi
   # base-packages may have just upgraded openssh; a reload racing that restart
@@ -131,9 +144,13 @@ EOF
   return 0
 }
 base-ssh-harden::verify() {
-  # /run/sshd is absent on a fresh image until sshd first starts; sshd -t needs it.
-  mkdir -p /run/sshd
-  sshd -t 2>/dev/null
+  # Without a root key apply leaves password auth on by design.
+  if ! grep -qE '^(ssh|ecdsa)' /root/.ssh/authorized_keys 2>/dev/null; then
+    mkdir -p /run/sshd
+    sshd -t 2>/dev/null
+    return
+  fi
+  sshd -t 2>/dev/null && _ssh_harden_effective
 }
 
 STEP_DESC["swap-disable"]="disable swap (kubelet requirement on cluster nodes)"
